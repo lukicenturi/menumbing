@@ -24,8 +24,10 @@ use Menumbing\EventStream\Driver\Redis\RedisStream;
 use Menumbing\EventStream\Enum\ReadMessageFrom;
 use Menumbing\EventStream\EventRegistry;
 use Menumbing\EventStream\Exception\EventNameConflictedException;
+use Menumbing\EventStream\Tests\Support\RecordingEarliestOffsetConsumer;
 use Menumbing\EventStream\Tests\Support\UserCreated;
 use Mockery;
+use RuntimeException;
 use ReflectionClass;
 use ReflectionMethod;
 use ReflectionProperty;
@@ -155,6 +157,74 @@ class RegistryAndDriversTest extends AbstractTestCase
         $this->assertCount(1, $requests);
         $partitions = $requests[0]->getTopics()[0]->getPartitions();
         $this->assertSame([EarliestOffsetConsumer::EARLIEST_TIMESTAMP, EarliestOffsetConsumer::EARLIEST_TIMESTAMP], array_map(static fn ($p): int => $p->getTimestamp(), $partitions));
+    }
+
+    public function testRejoinJoinsFirstAndThenSeeks(): void
+    {
+        $consumer = (new ReflectionClass(RecordingEarliestOffsetConsumer::class))->newInstanceWithoutConstructor();
+
+        $consumer->rejoin();
+
+        $this->assertSame(['join', 'seek'], $consumer->calls);
+    }
+
+    /**
+     * The join started the heartbeat; a failed seek must not leave a joined
+     * member with a live timer. It is rethrown, not swallowed: falling back to
+     * the library position could jump to the newest message.
+     */
+    public function testAFailedSeekStopsTheHeartbeatLeavesTheGroupAndRethrows(): void
+    {
+        $consumer = (new ReflectionClass(RecordingEarliestOffsetConsumer::class))->newInstanceWithoutConstructor();
+        $consumer->failSeek = true;
+
+        try {
+            $consumer->rejoin();
+            $this->fail('The seek failure should surface.');
+        } catch (RuntimeException $e) {
+            $this->assertSame('ListOffsets timed out', $e->getMessage());
+        }
+
+        $this->assertSame(['join', 'seek', 'stop-heartbeat', 'close'], $consumer->calls);
+    }
+
+    /**
+     * `getBrokerIdByTopic()` gives the metadata leader id, -1 for a partition
+     * without a leader. That partition keeps its position; the others seek.
+     */
+    public function testAPartitionWithoutALeaderIsSkipped(): void
+    {
+        $requests = [];
+        $client = Mockery::mock(ClientInterface::class);
+        $client->shouldReceive('sendRecv')->andReturnUsing(static function (ListOffsetRequest $request) use (&$requests): ListOffsetResponse {
+            $requests[] = $request;
+
+            return (new ListOffsetResponse())->setTopics([
+                (new ListOffsetTopicResponse())->setName('user-events.billing-service.dlq')->setPartitions([
+                    (new ListOffsetPartitionResponse())->setPartitionIndex(0)->setErrorCode(ErrorCode::NONE)->setOffset(40),
+                ]),
+            ]);
+        });
+        /** @var Broker&Mockery\MockInterface $broker */
+        $broker = Mockery::mock(Broker::class);
+        $broker->shouldReceive('getTopicsMeta')->andReturn([]);
+        $broker->shouldReceive('getBrokerIdByTopic')->with('user-events.billing-service.dlq', 0)->andReturn(1);
+        $broker->shouldReceive('getBrokerIdByTopic')->with('user-events.billing-service.dlq', 1)->andReturn(-1);
+        $broker->shouldReceive('getClientByBrokerId')->with(1)->andReturn($client);
+        $broker->shouldNotReceive('getClientByBrokerId')->with(-1);
+
+        $offsetManager = new OffsetManager($broker, 1, 'user-events.billing-service.dlq', [0, 1], 'billing-service-dlq-replay', null, 'member-1', 1);
+        (new ReflectionProperty(OffsetManager::class, 'offsets'))->setValue($offsetManager, [0 => 0, 1 => 0]);
+        $consumer = (new ReflectionClass(EarliestOffsetConsumer::class))->newInstanceWithoutConstructor();
+        (new ReflectionProperty(Consumer::class, 'broker'))->setValue($consumer, $broker);
+        (new ReflectionProperty(Consumer::class, 'config'))->setValue($consumer, new ConsumerConfig());
+        (new ReflectionProperty(Consumer::class, 'offsetManagers'))->setValue($consumer, ['user-events.billing-service.dlq' => $offsetManager]);
+
+        (new ReflectionMethod($consumer, 'seekToEarliestWhereNotRetained'))->invoke($consumer);
+
+        $this->assertSame([0 => 40, 1 => 0], $offsetManager->getOffsets());
+        $this->assertCount(1, $requests);
+        $this->assertSame([0], array_map(static fn ($p): int => $p->getPartitionIndex(), $requests[0]->getTopics()[0]->getPartitions()));
     }
 
     /**

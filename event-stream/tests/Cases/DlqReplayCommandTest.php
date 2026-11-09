@@ -533,6 +533,42 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertSame(['leave:' . self::DLQ, 'clear-timers'], $this->command->calls);
     }
 
+    /**
+     * A consumer process may set its own $groupName. --group names that
+     * group: it picks the dead-letter stream, the replay group, and which
+     * dead letters count as its own rather than foreign.
+     */
+    public function testTheGroupOptionReplaysTheDeadLettersOfAnotherGroup(): void
+    {
+        $dlq = self::SOURCE . '.custom-group.dlq';
+        $own = $this->stream->push(new StreamMessage($dlq, self::TYPE, ['userId' => 'u-1'], [
+            'dead_letter' => ['source_stream' => self::SOURCE, 'group' => 'custom-group', 'message_id' => 'source-1'],
+        ], 'dlq-1'));
+        $this->deadLetter('dlq-2', 'source-2');
+
+        $this->assertSame(0, $this->replay('--stream=' . self::SOURCE . ' --group=custom-group --idle-seconds=0'));
+
+        // A round that reads the message, then an empty one that ends the run.
+        $this->assertSame(array_fill(0, 2, ['group' => 'custom-group-dlq-replay', 'stream' => $dlq]), $this->stream->subscriptions);
+        $this->assertSame([['group' => 'custom-group-dlq-replay', 'stream' => $dlq, 'id' => $own->id]], $this->stream->acked);
+        $this->assertCount(1, $this->command->dispatched);
+        // The dead letters of the configured group are not touched.
+        $this->assertCount(1, $this->stream->queues[self::DLQ]);
+    }
+
+    public function testADeadLetterOfTheConfiguredGroupIsForeignUnderAnotherGroup(): void
+    {
+        $dlq = self::SOURCE . '.custom-group.dlq';
+        $this->stream->push(new StreamMessage($dlq, self::TYPE, ['userId' => 'u-1'], [
+            'dead_letter' => ['source_stream' => self::SOURCE, 'group' => self::GROUP, 'message_id' => 'source-1'],
+        ], 'dlq-1'));
+
+        $this->assertSame(0, $this->replay('--stream=' . self::SOURCE . ' --group=custom-group --idle-seconds=30'));
+
+        $this->assertSame([], $this->command->dispatched);
+        $this->assertMatchesRegularExpression('/Skipped \(other group\)\s*\|?\s*1/', $this->output->fetch());
+    }
+
     private function replay(string $arguments): int
     {
         // The command is built bare, with no console application around it.

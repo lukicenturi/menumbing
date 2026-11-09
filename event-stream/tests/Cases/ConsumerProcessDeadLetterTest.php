@@ -340,9 +340,10 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
 
     /**
      * A listener of DeadLettered that throws must not leave the original
-     * unacked: that would shift the Kafka counter by one.
+     * unacked: that would shift the Kafka counter by one. It is logged, not
+     * rethrown: a rethrow would reach the subscribe loop as `Subscribe failed`.
      */
-    public function testAThrowingDeadLetteredListenerStillLetsTheOriginalBeAcked(): void
+    public function testAThrowingDeadLetteredListenerIsLoggedAndTheOriginalAcked(): void
     {
         $this->container->set(EventDispatcherInterface::class, new class implements EventDispatcherInterface {
             public function dispatch(object $event): object
@@ -356,15 +357,109 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         });
         $process = $this->process(static fn (): Result => Result::NACK);
 
-        try {
-            $process->consume($this->message());
-            $this->fail('The listener failure should surface.');
-        } catch (RuntimeException $e) {
-            $this->assertSame('Listener broke', $e->getMessage());
-        }
+        $process->consume($this->message());
 
         $this->assertCount(1, $this->stream->publishedTo(self::DLQ));
         $this->assertSame([self::MESSAGE_ID], $this->stream->ackedIds());
+        $errors = $this->logger->messages('error');
+        $this->assertCount(1, $errors);
+        $this->assertStringContainsString('EventStream [Dead-lettered listener failed] event=' . DeadLettered::class, $errors[0]);
+    }
+
+    /**
+     * A throwing ConsumeFailed listener on the first attempt must not leave
+     * processMessage() early: the message is still retried and acked.
+     */
+    public function testAThrowingConsumeFailedListenerDoesNotEscapeOrSkipTheAck(): void
+    {
+        $this->container->set(EventDispatcherInterface::class, new class implements EventDispatcherInterface {
+            public function dispatch(object $event): object
+            {
+                if ($event instanceof ConsumeFailed && 0 === $event->message->context['retry_count']) {
+                    throw new RuntimeException('Metrics listener broke');
+                }
+
+                return $event;
+            }
+        });
+        $process = $this->process(static fn (int $call): Result => 1 === $call ? Result::NACK : Result::ACK);
+
+        $process->consume($this->message());
+
+        $this->assertCount(2, $process->handled);
+        $this->assertSame([self::MESSAGE_ID], $this->stream->ackedIds());
+        $this->assertSame([], $this->stream->published);
+        $errors = $this->logger->messages('error');
+        $this->assertCount(1, $errors);
+        $this->assertStringContainsString('EventStream [Listener failed] event=' . ConsumeFailed::class, $errors[0]);
+        $this->assertStringContainsString('message_id=' . self::MESSAGE_ID, $errors[0]);
+        $this->assertStringContainsString('error=Metrics listener broke', $errors[0]);
+    }
+
+    public function testThrowingListenersOnEveryAttemptStillEndInADeadLetter(): void
+    {
+        $this->container->set(EventDispatcherInterface::class, new class implements EventDispatcherInterface {
+            public function dispatch(object $event): object
+            {
+                if ($event instanceof BeforeConsume || $event instanceof ConsumeFailed || $event instanceof DeadLettered) {
+                    throw new RuntimeException('Listener broke');
+                }
+
+                return $event;
+            }
+        });
+        $process = $this->process(static fn (): Result => Result::NACK);
+
+        $process->consume($this->message());
+
+        $this->assertCount(3, $process->handled);
+        $this->assertCount(1, $this->stream->publishedTo(self::DLQ));
+        $this->assertSame([self::MESSAGE_ID], $this->stream->ackedIds());
+        // 3 BeforeConsume + 3 ConsumeFailed + 1 DeadLettered.
+        $this->assertCount(7, $this->logger->messages('error'));
+    }
+
+    /**
+     * With `retries: n` the handler turns a skip-listed exception into a NACK.
+     * It is still deterministic, so it is dead-lettered after 1 attempt.
+     */
+    public function testASkipListedExceptionBehindANackIsDeadLetteredAtOnce(): void
+    {
+        AnnotationCollector::collectClass(UserCreated::class, ConsumedEvent::class, new ConsumedEvent(stream: self::STREAM, name: 'user.created', retries: 2));
+        $registry = new EventRegistry();
+        $registry->init();
+        $listeners = new class implements EventDispatcherInterface {
+            public function dispatch(object $event): object
+            {
+                throw new InvalidArgumentException('Malformed userId');
+            }
+        };
+        $handler = new ConsumerEventHandler($listeners, $registry, new Serializer([new ObjectNormalizer()], [new JsonEncoder()]));
+        $process = $this->process(static fn (int $call, StreamMessage $message): Result => $handler(self::GROUP, $message));
+
+        $process->consume($this->message());
+
+        $this->assertCount(1, $process->handled);
+        $this->assertSame([], $process->pauses);
+        $deadLetter = $this->stream->publishedTo(self::DLQ)[0]->context['dead_letter'];
+        $this->assertSame(1, $deadLetter['attempts']);
+        $this->assertSame(InvalidArgumentException::class, $deadLetter['error']['class']);
+        $this->assertSame([self::MESSAGE_ID], $this->stream->ackedIds());
+    }
+
+    /**
+     * A bare NACK has no exception, so even a skip list that matches
+     * RuntimeException (the parent of MessageNackedException) does not cut
+     * its retries short.
+     */
+    public function testABareNackIsNeverSkipListed(): void
+    {
+        $this->config->set('event_stream.skip_exceptions', [RuntimeException::class]);
+        $process = $this->process(static fn (): Result => Result::NACK);
+
+        $process->consume($this->message());
+
+        $this->assertCount(3, $process->handled);
     }
 
     public function testTheDeadLetteredLineIsLoggedAsAnErrorEvenWithDebugOff(): void
