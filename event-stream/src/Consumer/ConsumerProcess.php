@@ -30,6 +30,7 @@ use Menumbing\EventStream\Event\SubscribeFailed;
 use Menumbing\EventStream\EventRegistry;
 use Menumbing\EventStream\Exception\MessageNackedException;
 use Menumbing\EventStream\Factory\StreamFactory;
+use Menumbing\EventStream\Handler\ConsumerEventHandler;
 use Psr\Container\ContainerInterface;
 use Throwable;
 
@@ -159,7 +160,10 @@ abstract class ConsumerProcess extends AbstractProcess
      * `#[ConsumedEvent(retries: n)]` shares the same budget: the attempt index
      * goes into `retry_count`, so ConsumerEventHandler answers NACK while
      * `retry_count < n` and rethrows after. Either answer counts as one failed
-     * attempt, and `max_attempts` is the ceiling for both.
+     * attempt, and `max_attempts` is the ceiling for both. For a NACK, the
+     * exception that the handler caught is used as the failure, so the real
+     * error reaches `ConsumeFailed` and `dead_letter.error` also when
+     * `n >= max_attempts` and no attempt rethrows.
      */
     protected function processMessage(StreamMessage $message): void
     {
@@ -181,6 +185,8 @@ abstract class ConsumerProcess extends AbstractProcess
 
             $this->event?->dispatch(new BeforeConsume($consumerName, $this->groupName, $attempt, $this->stream, $this->driverName));
 
+            ConsumerEventHandler::takeNackReason();
+
             try {
                 $result = call_user_func($this->handler(), $this->groupName, $attempt);
             } catch (Throwable $e) {
@@ -194,7 +200,9 @@ abstract class ConsumerProcess extends AbstractProcess
                 return;
             }
 
-            $failure = $result instanceof Throwable ? $result : MessageNackedException::afterAttempt($attempts);
+            $failure = $result instanceof Throwable
+                ? $result
+                : (ConsumerEventHandler::takeNackReason() ?? MessageNackedException::afterAttempt($attempts));
 
             // One `EventStream [Consume failed]` line per failed attempt.
             $this->event?->dispatch(new ConsumeFailed($consumerName, $this->groupName, $attempt, $this->stream, $this->driverName, $failure));
@@ -230,6 +238,8 @@ abstract class ConsumerProcess extends AbstractProcess
 
         try {
             $result = call_user_func($this->handler(), $this->groupName, $message);
+            // Not used on this path; dropped so the context does not hold it.
+            ConsumerEventHandler::takeNackReason();
 
             if (Result::ACK === $result) {
                 unset($this->retryCounters[$message->id]);
@@ -256,7 +266,9 @@ abstract class ConsumerProcess extends AbstractProcess
     {
         $deadLetterStream = $options->streamFor((string) $this->streamName, (string) $this->groupName);
         $context = $message->context;
-        unset($context['retry_count']);
+        // `owner` is added by RedisStream::getIdleMessages() to a claimed
+        // entry; like `retry_count`, it describes this delivery, not the message.
+        unset($context['retry_count'], $context['owner']);
 
         // No id: the driver gives the copy a new one. Redis only accepts a new
         // entry id above the last one of the target stream, so the source id
@@ -315,6 +327,8 @@ abstract class ConsumerProcess extends AbstractProcess
             return;
         }
 
+        $listenerFailure = null;
+
         try {
             $this->event?->dispatch(new DeadLettered(
                 $this->getConsumerName(),
@@ -325,10 +339,31 @@ abstract class ConsumerProcess extends AbstractProcess
                 $attempts,
                 $failure,
             ));
-        } finally {
-            // In `finally`: a listener of DeadLettered that throws must not
-            // leave the original unacked (see processMessage()).
-            $this->stream->ack($this->groupName, $this->streamName, [$message->id]);
+        } catch (Throwable $e) {
+            // A listener of DeadLettered that throws must not leave the
+            // original unacked (see processMessage()). It is logged before the
+            // ack, so the record of where the message went survives an ack
+            // that throws too; then it is rethrown.
+            $listenerFailure = $e;
+            $this->logger()->error(
+                'EventStream [Dead-lettered listener failed] consumer={consumer} group={group} stream={stream} dead_letter_stream={dead_letter_stream} message_id={message_id} type={type} error={error}',
+                [
+                    'consumer' => $this->getConsumerName(),
+                    'group' => (string) $this->groupName,
+                    'stream' => (string) $this->streamName,
+                    'dead_letter_stream' => $deadLetterStream,
+                    'message_id' => (string) $message->id,
+                    'type' => $message->type,
+                    'error' => $e->getMessage(),
+                    'exception' => (string) $e,
+                ],
+            );
+        }
+
+        $this->stream->ack($this->groupName, $this->streamName, [$message->id]);
+
+        if (null !== $listenerFailure) {
+            throw $listenerFailure;
         }
     }
 
@@ -338,8 +373,9 @@ abstract class ConsumerProcess extends AbstractProcess
     }
 
     /**
-     * Coroutine-aware under the Swoole runtime hooks, so a pause blocks this
-     * message only. Kafka heartbeats run on a timer and keep going meanwhile.
+     * Coroutine-aware under the sleep hook (SWOOLE_HOOK_SLEEP), so a pause
+     * blocks this message only. Kafka heartbeats run on a timer and keep going
+     * meanwhile.
      */
     protected function pause(int $milliseconds): void
     {

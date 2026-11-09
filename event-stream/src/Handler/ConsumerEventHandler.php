@@ -4,17 +4,24 @@ declare(strict_types=1);
 
 namespace Menumbing\EventStream\Handler;
 
+use Hyperf\Context\Context;
 use Menumbing\Contract\EventStream\StreamMessage;
 use Menumbing\EventStream\Enum\Result;
 use Menumbing\EventStream\EventRegistry;
 use Psr\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\Serializer\Serializer;
+use Throwable;
 
 /**
  * @author  Iqbal Maulana <iq.bluejack@gmail.com>
  */
 class ConsumerEventHandler
 {
+    /**
+     * Context key of the exception behind the last NACK in this coroutine.
+     */
+    public const NACK_REASON = self::class . '.nack_reason';
+
     public function __construct(
         protected EventDispatcherInterface $event,
         protected EventRegistry $eventRegistry,
@@ -39,8 +46,27 @@ class ConsumerEventHandler
                 throw $e;
             }
 
+            // The NACK answer cannot carry the exception, and without it the
+            // real error of a `retries: n` event would be logged nowhere.
+            // Coroutine context, not a property: one handler instance serves
+            // every coroutine of a concurrent batch.
+            Context::set(self::NACK_REASON, $e);
+
             return Result::NACK;
         }
+    }
+
+    /**
+     * Returns and forgets the exception behind the last NACK of this
+     * coroutine, if there is one. Call it before a handler call too, so a
+     * stale reason cannot be taken for the next NACK.
+     */
+    public static function takeNackReason(): ?Throwable
+    {
+        $reason = Context::get(self::NACK_REASON);
+        Context::destroy(self::NACK_REASON);
+
+        return $reason instanceof Throwable ? $reason : null;
     }
 
     protected function handle(StreamMessage $message, array $metadata): Result
