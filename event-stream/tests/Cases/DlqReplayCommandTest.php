@@ -28,14 +28,6 @@ use Symfony\Component\Console\Input\StringInput;
 use Symfony\Component\Console\Output\BufferedOutput;
 
 /**
- * `event-stream:dlq-replay` over an in-memory stream that, like Kafka, hands
- * back every unacked message on the next read.
- *
- * Two things matter most here. The replay is local: nothing may be published
- * to the source stream, because every other group on that fan-out stream would
- * consume it again. And the run must end: a dry run acks nothing, so without
- * the "already handled" stop it would read the same batch forever.
- *
  * @internal
  * @coversNothing
  *
@@ -85,7 +77,6 @@ class DlqReplayCommandTest extends AbstractTestCase
 
         $this->assertSame(0, $this->replay('--stream=' . self::SOURCE . ' --idle-seconds=0'));
 
-        // Local: the handler saw all three, the fan-out source stream saw nothing.
         $this->assertSame([], $this->stream->published);
         $this->assertCount(3, $this->command->dispatched);
         $this->assertSame([], $this->stream->queues[self::DLQ]);
@@ -103,7 +94,6 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertSame('source-1', $replayed->context['replayed_from_dlq']['original_message_id']);
         $this->assertSame(1, $replayed->context['replayed_from_dlq']['count']);
 
-        // Producers are registered before the first local dispatch.
         $this->assertContains('boot', $this->command->calls);
 
         $text = $this->output->fetch();
@@ -126,12 +116,10 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertCount(1, $left);
         $this->assertSame(1, $left[0]->context['replayed_from_dlq']['count']);
         $this->assertSame('source-1', $left[0]->context['replayed_from_dlq']['original_message_id']);
-        // The first failure stays on record; the replay failure is added.
         $this->assertSame('Account not found', $left[0]->context['dead_letter']['error']['message']);
         $this->assertSame('Account still missing', $left[0]->context['dead_letter']['last_replay_error']['message']);
         $this->assertSame(RuntimeException::class, $left[0]->context['dead_letter']['last_replay_error']['class']);
         $this->assertArrayNotHasKey('retry_count', $left[0]->context);
-        // The re-parked copy came round once and ended the run; it was not run twice.
         $this->assertCount(1, $this->command->dispatched);
         $text = $this->output->fetch();
         $this->assertMatchesRegularExpression('/Failed again \(kept on the DLQ\)\s*\|?\s*1/', $text);
@@ -168,7 +156,6 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->deadLetter('dlq-1', 'source-1');
         $this->deadLetter('dlq-2', 'source-2');
 
-        // A long idle timeout: the run must end on the re-read batch, not the clock.
         $this->assertSame(0, $this->replay('--stream=' . self::SOURCE . ' --dry-run --idle-seconds=30'));
 
         $this->assertSame([], $this->command->dispatched);
@@ -183,11 +170,6 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertSame(2, substr_count($text, 'WOULD REPLAY dlq_id='));
     }
 
-    /**
-     * A filtered-out message must still be on the dead-letter stream for the
-     * next run. With the counter-style Kafka ack, leaving it unacked would not
-     * do that, so it is re-parked: same lineage, moved to the end, then acked.
-     */
     public function testTheTypeFilterReplaysMatchesAndKeepsTheRestOnTheDeadLetterStream(): void
     {
         $match = $this->deadLetter('dlq-1', 'source-1');
@@ -214,7 +196,6 @@ class DlqReplayCommandTest extends AbstractTestCase
 
         $this->assertSame(1, $this->replay('--stream=' . self::SOURCE . ' --type=' . self::TYPE . ' --idle-seconds=0'));
 
-        // Stopped at the first message: nothing acked, nothing after it touched.
         $this->assertSame([], $this->stream->acked);
         $this->assertSame([], $this->command->dispatched);
         $this->assertCount(2, $this->stream->queues[self::DLQ]);
@@ -288,10 +269,6 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertStringContainsString('"userId":"0c8a6f2e-5b41-4e3d-9f7a-2d6b1c4e8a90"', $warnings[0]);
     }
 
-    /**
-     * Two copies with one lineage, as a crash between a re-park and its ack
-     * leaves them: the second is recognised as already handled.
-     */
     public function testTheStopIsKeyedOnTheLineageNotTheMessageId(): void
     {
         $this->deadLetter('dlq-1', 'source-1');
@@ -303,11 +280,6 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertStringContainsString('every new message was read', $this->output->fetch());
     }
 
-    /**
-     * A message written to the dead-letter stream by hand has no lineage. Its
-     * re-parked copy gets a new id, so the current id is written into the
-     * copy; else the copy would look new and the run would never end.
-     */
     public function testAMessageWithoutLineageIsReParkedOnceAndTheRunEnds(): void
     {
         $this->stream->push(new StreamMessage(self::DLQ, 'user.deleted', ['userId' => 'u-1'], [], 'hand-made'));
@@ -355,10 +327,6 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertStringContainsString('no new message for', $this->output->fetch());
     }
 
-    /**
-     * The producers are registered once per process, so a second registration
-     * inside a server worker would publish every produced event twice.
-     */
     public function testTheCommandRefusesToRunInsideAServerProcess(): void
     {
         $this->deadLetter('dlq-1', 'source-1');
@@ -371,11 +339,6 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertStringContainsString('CLI-only', $this->output->fetch());
     }
 
-    /**
-     * Redis keeps a read but unacked entry in the pending list of the replay
-     * group, and a plain read never returns it again. Those entries (from a
-     * dry run, or a crash before an ack) are claimed first.
-     */
     public function testPendingEntriesOfAnEarlierRunAreClaimedFirst(): void
     {
         $pending = $this->deadLetter('dlq-1', 'source-1');
@@ -406,11 +369,6 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertSame(2, substr_count($this->output->fetch(), 'WOULD REPLAY dlq_id='));
     }
 
-    /**
-     * The real command, with nothing replaced but the timer clear: the shared
-     * registry is filled on first use, the producers are registered, and the
-     * consumed event reaches the local dispatcher as its own class.
-     */
     public function testTheRealCommandDispatchesTheConsumedEventClassLocally(): void
     {
         AnnotationCollector::collectClass(UserCreated::class, ConsumedEvent::class, new ConsumedEvent(stream: self::SOURCE, name: self::TYPE));
@@ -430,15 +388,9 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertSame('0c8a6f2e-5b41-4e3d-9f7a-2d6b1c4e8a90', $dispatched[0]->userId);
         $this->assertSame('jane@example.com', $dispatched[0]->email);
         $this->assertSame([$message->id, 'dlq-2'], $this->stream->ackedIds());
-        // The unknown type was kept, not acked away by the handler.
         $this->assertSame(['user.retired-event'], array_map(static fn (StreamMessage $m): string => $m->type, $this->stream->queues[self::DLQ]));
     }
 
-    /**
-     * A NACK from ConsumerEventHandler (an event with `retries` left) keeps
-     * the exception it caught; the re-parked copy records that, not a bare
-     * "handler returned NACK".
-     */
     public function testAReplayNackRecordsTheRealError(): void
     {
         $this->deadLetter('dlq-1', 'source-1');
@@ -455,10 +407,6 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertSame('Ledger is down', $error['message']);
     }
 
-    /**
-     * Kept messages of another group or of an unknown type do not spend the
-     * --limit: it counts replayed and held messages only.
-     */
     public function testForeignAndUnknownMessagesDoNotSpendTheLimit(): void
     {
         $this->command->unknownTypes = ['user.retired-event'];
@@ -492,10 +440,6 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertMatchesRegularExpression('/Skipped \(--type filter\)\s*\|?\s*2/', $text);
     }
 
-    /**
-     * RedisStream adds `owner` to a claimed entry. It describes that read, so
-     * neither the replayed message nor a re-parked copy carries it.
-     */
     public function testTheRedisOwnerOfAClaimedEntryIsDropped(): void
     {
         $pending = $this->deadLetter('dlq-1', 'source-1');
@@ -512,10 +456,6 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertArrayNotHasKey('owner', $parked[0]->context);
     }
 
-    /**
-     * On Kafka the replay consumer must start at the earliest retained dead
-     * letter, not at the newest one, when its position is no longer retained.
-     */
     public function testAKafkaReplayReadsWithTheEarliestOffsetReset(): void
     {
         $kafka = Mockery::mock(KafkaStream::class);
@@ -533,11 +473,6 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertSame(['leave:' . self::DLQ, 'clear-timers'], $this->command->calls);
     }
 
-    /**
-     * A consumer process may set its own $groupName. --group names that
-     * group: it picks the dead-letter stream, the replay group, and which
-     * dead letters count as its own rather than foreign.
-     */
     public function testTheGroupOptionReplaysTheDeadLettersOfAnotherGroup(): void
     {
         $dlq = self::SOURCE . '.custom-group.dlq';
@@ -548,11 +483,9 @@ class DlqReplayCommandTest extends AbstractTestCase
 
         $this->assertSame(0, $this->replay('--stream=' . self::SOURCE . ' --group=custom-group --idle-seconds=0'));
 
-        // A round that reads the message, then an empty one that ends the run.
         $this->assertSame(array_fill(0, 2, ['group' => 'custom-group-dlq-replay', 'stream' => $dlq]), $this->stream->subscriptions);
         $this->assertSame([['group' => 'custom-group-dlq-replay', 'stream' => $dlq, 'id' => $own->id]], $this->stream->acked);
         $this->assertCount(1, $this->command->dispatched);
-        // The dead letters of the configured group are not touched.
         $this->assertCount(1, $this->stream->queues[self::DLQ]);
     }
 
@@ -571,9 +504,6 @@ class DlqReplayCommandTest extends AbstractTestCase
 
     private function replay(string $arguments): int
     {
-        // The command is built bare, with no console application around it.
-        // Without the dispatcher an exception in handle() is rethrown here
-        // instead of being swallowed.
         return $this->command->run(new StringInput($arguments . ' --disable-event-dispatcher'), $this->output);
     }
 

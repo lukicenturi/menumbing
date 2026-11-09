@@ -15,34 +15,13 @@ use longlang\phpkafka\Util\KafkaUtil;
 use Throwable;
 
 /**
- * A consumer that starts at the earliest retained message when its position
- * is no longer retained, instead of at the newest one.
- *
- * longlang/phpkafka starts a group at `max(committed, 0)`. If retention has
- * already deleted that offset, the fetch answers OFFSET_OUT_OF_RANGE, and the
- * client then calls `OffsetManager::updateListOffsets()`, which only asks for
- * the LATEST offset (timestamp -1): the consumer jumps to the end of the
- * partition and every older retained message is skipped without a trace. For
- * a fresh group on a topic whose first segment expired, that is every message.
- *
- * So after each (re)join, before the first fetch, this consumer asks for the
- * EARLIEST offset (timestamp -2) of each partition and moves a position that
- * is below it up to it. A position that is still retained does not change.
- *
- * Selected with the consumer option `offset_reset => 'earliest'`.
- *
- * If that seek fails, the consumer stops its heartbeat, leaves the group and
- * throws: it does not fall back to the library position.
- *
- * Limit: a segment that expires while this consumer reads it still triggers
- * the library's jump to the end, because that fallback runs inside the
- * private fetch loop.
+ * longlang/phpkafka jumps to LATEST when a group's offset is no longer retained (e.g. offset 0 of a
+ * fresh group after the first segment expired). After each join, this moves such positions to EARLIEST.
  *
  * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 class EarliestOffsetConsumer extends Consumer
 {
-    /** ListOffsets timestamp for the log start offset. */
     public const EARLIEST_TIMESTAMP = -2;
 
     public function rejoin(): void
@@ -52,19 +31,13 @@ class EarliestOffsetConsumer extends Consumer
         try {
             $this->seekToEarliestWhereNotRetained();
         } catch (Throwable $e) {
-            // The join already started the heartbeat timer. Left alone, a
-            // failed seek would leave a joined member with a live timer behind
-            // (one per failed subscribe round, and FENCED_INSTANCE_ID on later
-            // ticks). Rethrown, not swallowed: falling back to the library
-            // position could jump to the newest message, and a wrong start
-            // position is worse than a failed run. The caller builds a new
-            // consumer on its next round.
+            // The join started the heartbeat: stop it, or a joined member stays behind with a live timer.
+            // Rethrown, not swallowed: the library fallback could start at the newest message.
             $this->stopHeartbeat();
 
             try {
                 $this->close();
             } catch (Throwable) {
-                // Leaving the group is best effort; the error that matters is $e.
             }
 
             throw $e;
@@ -72,10 +45,6 @@ class EarliestOffsetConsumer extends Consumer
     }
 
     /**
-     * The step to add to each position that is below the earliest retained
-     * offset of its partition, keyed by partition. Positions that are still
-     * retained, and partitions without an earliest offset, are left out.
-     *
      * @param  array<int, int>  $positions  partition => fetch offset
      * @param  array<int, int>  $earliest  partition => earliest retained offset
      *
@@ -94,9 +63,6 @@ class EarliestOffsetConsumer extends Consumer
         return $steps;
     }
 
-    /**
-     * The library join; a seam so the order (join first, then seek) is testable.
-     */
     protected function joinGroup(): void
     {
         parent::rejoin();
@@ -114,8 +80,6 @@ class EarliestOffsetConsumer extends Consumer
 
             $earliest = $this->listEarliestOffsets((string) $topic, array_keys($positions));
 
-            // OffsetManager keeps its positions private; addFetchOffset() is
-            // the public way to move one.
             foreach (self::stepsToEarliest($positions, $earliest) as $partition => $step) {
                 $offsetManager->addFetchOffset($partition, $step);
             }
@@ -123,9 +87,6 @@ class EarliestOffsetConsumer extends Consumer
     }
 
     /**
-     * The same request as `OffsetManager::updateListOffsets()`, with the
-     * EARLIEST timestamp, and the offsets returned instead of applied.
-     *
      * @param  int[]  $partitions
      *
      * @return array<int, int> partition => earliest retained offset
@@ -139,10 +100,6 @@ class EarliestOffsetConsumer extends Consumer
         foreach ($partitions as $partition) {
             $brokerId = $broker->getBrokerIdByTopic($topic, $partition);
 
-            // No known leader: null when the partition is not in the metadata,
-            // -1 (the metadata leader id) when it has no leader right now.
-            // Leave that partition on the library's own position rather than
-            // asking a broker that does not exist.
             if (null === $brokerId || $brokerId < 0) {
                 continue;
             }

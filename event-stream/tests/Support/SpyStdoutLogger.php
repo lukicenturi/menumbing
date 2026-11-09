@@ -9,9 +9,6 @@ use Psr\Log\AbstractLogger;
 use Stringable;
 
 /**
- * Keeps every log call with its placeholders filled in, the way the stdout
- * logger prints them.
- *
  * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 final class SpyStdoutLogger extends AbstractLogger implements StdoutLoggerInterface

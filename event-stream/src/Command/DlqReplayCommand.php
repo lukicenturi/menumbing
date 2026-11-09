@@ -33,53 +33,8 @@ use Throwable;
 use function Hyperf\Support\make;
 
 /**
- * Replays dead-lettered messages from `<stream>.<group><suffix>` into the
- * listeners of this application.
- *
- * The replay is LOCAL: each message goes through ConsumerEventHandler in this
- * process, exactly as the consumer process would have dispatched it. Nothing
- * is published to `<stream>`. A source stream is often a fan-out stream, so a
- * copy published there would be consumed again by every other group on it,
- * and their listeners would do the same work twice.
- *
- * Reads with its own consumer group, `<group>-dlq-replay`, where `<group>` is
- * --group or `event_stream.group_name`. Later runs
- * resume after the last acked message. The start position needs care:
- *
- * - Kafka: longlang/phpkafka starts a new group at offset 0, and when that
- *   offset is no longer retained it jumps to the NEWEST message, which skips
- *   every older retained dead letter. So the command reads with
- *   `offset_reset => 'earliest'` (EarliestOffsetConsumer): a position that is
- *   not retained moves to the earliest retained message instead.
- * - Redis: the group is created at the start of the stream, because the dead
- *   letters were written before it existed.
- *
- * A dead letter that retention deletes before a real run is gone; a dry run
- * commits nothing, so it does not hold the position either.
- *
- * Three traits of the Kafka client shape this command:
- *
- * - An ack is a counter per partition, not a mark per message: it moves the
- *   committed offset one step forward, whichever message it names. A message
- *   left unacked between two acked ones is therefore skipped anyway. So a
- *   message that must stay on the dead-letter stream (filtered out by --type,
- *   failed again, held by the poison guard, or dead-lettered by another group)
- *   is re-parked: published to the dead-letter stream again and then acked. It
- *   moves to the end of the stream instead of falling out of it.
- *
- * - Nothing advances the fetch position but an ack. A dry run acks nothing, so
- *   every fetch returns the same messages again. The run stops at the first
- *   message it has already handled. In a dry run that is the start of the same
- *   batch again; in a real run it is the first message this run re-parked.
- *   Either way, everything new has been seen.
- *
- * - One fetch reads from one partition leader. On a dead-letter topic with
- *   several partitions, a run that re-parks messages can reach its own
- *   re-parked copy on one partition before it has read the others, and stop
- *   early. Run it again; the next run starts where this one stopped.
- *
- * Each subscribe() call waits a fraction of a second for a fetch and then
- * returns, so --idle-seconds is a plain clock check between calls.
+ * Replays dead letters through the local listeners. Never republished to the source stream: other
+ * groups consume it and would run them again. A dry run acks nothing, so it cannot pin the position.
  *
  * @author  Luki Centuri <lukicenturi@gmail.com>
  */
@@ -89,7 +44,6 @@ class DlqReplayCommand extends HyperfCommand
 
     public const GROUP_SUFFIX = '-dlq-replay';
 
-    /** Pause between two empty fetches, so a fast driver does not spin. */
     private const EMPTY_ROUND_PAUSE = 0.1;
 
     private const OUTCOME_REPLAYED = 'replayed';
@@ -108,15 +62,10 @@ class DlqReplayCommand extends HyperfCommand
 
     private const OUTCOME_FAILED = 'failed';
 
-    /** Outcomes that keep a message without spending the --limit. */
     private const SKIPPED_OUTCOMES = [self::OUTCOME_FILTERED, self::OUTCOME_FOREIGN, self::OUTCOME_UNKNOWN];
 
     protected ?string $name = self::COMMAND_SIGNATURE;
 
-    /**
-     * Producers are registered once per process: registering them twice would
-     * publish every produced event twice.
-     */
     private static bool $runtimeBooted = false;
 
     private ?StreamInterface $stream = null;
@@ -127,7 +76,6 @@ class DlqReplayCommand extends HyperfCommand
         protected ContainerInterface $container,
         protected ConfigInterface $config,
     ) {
-        // The name comes from `$name`, so a subclass can give itself another one.
         parent::__construct();
 
         $this->setDescription('Replay dead-lettered event stream messages (<stream>.<group>.dlq) into the local listeners.');
@@ -156,9 +104,8 @@ class DlqReplayCommand extends HyperfCommand
 
     public function handle(): int
     {
-        // Inside a server worker the producers are already registered, and
-        // the second registration this command needs would publish every
-        // produced event twice for the life of the worker.
+        // Inside a server the producers are already registered; a second registration would publish
+        // every produced event twice.
         if (ProcessManager::isRunning()) {
             $this->error(sprintf('%s is CLI-only: it must not run inside a server process (e.g. a crontab).', self::COMMAND_SIGNATURE));
 
@@ -180,8 +127,6 @@ class DlqReplayCommand extends HyperfCommand
             return self::FAILURE;
         }
 
-        // A consumer process may set its own public $groupName; its dead
-        // letters are named after, and stamped with, that group.
         $consumerGroup = trim((string) $this->input->getOption('group'));
         $consumerGroup = '' === $consumerGroup ? (string) $this->config->get('event_stream.group_name', 'menumbing') : $consumerGroup;
         $deadLetterStream = $options->streamFor($source, $consumerGroup);
@@ -234,10 +179,6 @@ class DlqReplayCommand extends HyperfCommand
             $this->stream = $this->stream((string) $this->input->getOption('driver'));
             $this->createReplayGroup($group, $deadLetterStream);
 
-            // Entries an earlier run left pending in the replay group (a dry
-            // run, or a crash before an ack). Only Redis keeps those; the
-            // Kafka driver yields nothing here. A repeat ends this phase only:
-            // in a dry run every claimed entry stays pending and comes back.
             $this->consumeRound($this->pendingMessages($consumerName, $group, $deadLetterStream), $run, $state);
 
             if ('repeat' === $state['stop']) {
@@ -247,8 +188,6 @@ class DlqReplayCommand extends HyperfCommand
             while (null === $state['stop']) {
                 $received = $this->consumeRound($this->stream->subscribe($consumerName, $group, [$deadLetterStream]), $run, $state);
 
-                // The first call also joins the consumer group, which can take
-                // a while; the idle clock starts once that is done.
                 if ($received || null === $lastActivity) {
                     $lastActivity = microtime(true);
                 }
@@ -266,9 +205,6 @@ class DlqReplayCommand extends HyperfCommand
         } catch (Throwable $e) {
             $readError = $e;
         } finally {
-            // Also after a failed first fetch: it may have joined the group
-            // and started the heartbeat timer already, and that timer alone
-            // keeps the CLI process alive after handle() returns.
             if (null !== $this->stream) {
                 $this->leaveGroup($group, $deadLetterStream);
             }
@@ -310,29 +246,16 @@ class DlqReplayCommand extends HyperfCommand
         return $this->container->get(StreamFactory::class)->get($driver);
     }
 
-    /**
-     * ConsumerEventHandler, as the consumer process uses it: it maps the type
-     * to the consumed event class and dispatches it to the local listeners.
-     */
     protected function handler(): callable
     {
         return $this->consumerHandler ??= make(ConsumerEventHandler::class, ['eventRegistry' => $this->registry()]);
     }
 
-    /**
-     * ConsumerEventHandler answers ACK, without dispatching anything, for a
-     * type it does not know. That is right on a fan-out source stream and
-     * wrong here: a dead letter whose event class no longer exists would be
-     * acked and gone.
-     */
     protected function knowsType(string $type): bool
     {
         return $this->registry()->has($type);
     }
 
-    /**
-     * Runs registerRuntime() once per process, before the first local dispatch.
-     */
     protected function bootRuntime(): void
     {
         if (self::$runtimeBooted) {
@@ -343,30 +266,12 @@ class DlqReplayCommand extends HyperfCommand
         self::$runtimeBooted = true;
     }
 
-    /**
-     * A console command never fires BeforeMainServerStart, which is what
-     * registers the producers. Without them, a replayed listener that
-     * publishes an event would publish nothing. RegisterProducers ignores the
-     * event it is given. handle() already refused to run inside a server,
-     * where this registration would be the second one.
-     *
-     * An application whose listeners need more boot-time registration (for
-     * example HTTP clients registered on server start) extends this command,
-     * overrides this method and calls the parent.
-     */
+    /** Registers the producers a console command lacks; override it to register more at boot. */
     protected function registerRuntime(): void
     {
         $this->container->get(RegisterProducers::class)->process(new stdClass());
     }
 
-    /**
-     * Prepares the replay group to read from the start of what is retained.
-     *
-     * Kafka has no group to create, but its client would jump to the newest
-     * message when the start position is no longer retained (see the class
-     * comment). On Redis the replay group must start at the beginning of the
-     * stream: the dead letters were written before it existed.
-     */
     protected function createReplayGroup(string $group, string $deadLetterStream): void
     {
         if ($this->stream instanceof KafkaStream) {
@@ -382,11 +287,6 @@ class DlqReplayCommand extends HyperfCommand
         $this->stream?->createGroup($group, $deadLetterStream);
     }
 
-    /**
-     * Leaves the Kafka group and stops its heartbeat, so the static member
-     * does not hold its partitions for the session timeout. Only a consumer
-     * that subscribe() already built is closed.
-     */
     protected function leaveGroup(string $group, string $deadLetterStream): void
     {
         if (!$this->stream instanceof KafkaStream) {
@@ -400,11 +300,6 @@ class DlqReplayCommand extends HyperfCommand
         }
     }
 
-    /**
-     * The last guard against a hung exit: a heartbeat timer that close() did
-     * not stop keeps the event loop alive. The command is about to exit, so no
-     * timer is worth keeping.
-     */
     protected function clearTimers(): void
     {
         if (class_exists(Timer::class)) {
@@ -417,10 +312,6 @@ class DlqReplayCommand extends HyperfCommand
         return $this->container->get(StdoutLoggerInterface::class);
     }
 
-    /**
-     * The shared registry. In a server, ConsumerManager fills it at boot; a
-     * console command never gets there, so it is filled here, once.
-     */
     protected function registry(): EventRegistry
     {
         $registry = $this->container->get(EventRegistry::class);
@@ -443,9 +334,6 @@ class DlqReplayCommand extends HyperfCommand
         foreach ($messages as $message) {
             $received = true;
 
-            // Keyed on the lineage, not on the message id: every copy of one
-            // failed message shares this key, and a re-parked copy gets a new
-            // id. A crash between a re-park and its ack also leaves two copies.
             $key = $this->lineageKey($message);
 
             if (isset($state['handled'][$key])) {
@@ -515,8 +403,6 @@ class DlqReplayCommand extends HyperfCommand
             (string) ($deadLetter['last_replay_error']['message'] ?? $deadLetter['error']['message'] ?? '-'),
         );
 
-        // Another group's failure on a shared stream (a group with another
-        // name, or a stream written by hand): not ours to run.
         if (isset($deadLetter['group']) && $deadLetter['group'] !== $run['consumer_group']) {
             return $this->keep($message, $run, self::OUTCOME_FOREIGN);
         }
@@ -536,8 +422,6 @@ class DlqReplayCommand extends HyperfCommand
         }
 
         $context = $message->context;
-        // `owner` is added by RedisStream::getIdleMessages() to a claimed entry;
-        // it describes this read, not the message.
         unset($context['dead_letter'], $context['retry_count'], $context['owner']);
         $context['replayed_from_dlq'] = [
             'at' => (new DateTimeImmutable())->format(DATE_ATOM),
@@ -553,9 +437,6 @@ class DlqReplayCommand extends HyperfCommand
 
         $this->bootRuntime();
 
-        // retry_count 0 and one attempt: a NACK (an event with retries left)
-        // counts as a failure like a throw does, and the message goes back to
-        // the dead-letter stream for the next run.
         $replay = new StreamMessage($run['source'], $message->type, $message->data, [...$context, 'retry_count' => 0], $message->id);
 
         try {
@@ -573,9 +454,6 @@ class DlqReplayCommand extends HyperfCommand
             return self::OUTCOME_REPLAYED;
         }
 
-        // Back to the dead-letter stream with this replay counted, so the
-        // poison guard stops a message that can never succeed. The first
-        // failure stays on record in `dead_letter.error`.
         $deadLetter['last_replay_error'] = [
             'class' => $failure::class,
             'message' => $failure->getMessage(),
@@ -625,7 +503,6 @@ class DlqReplayCommand extends HyperfCommand
             return self::OUTCOME_DISCARDED;
         }
 
-        // The log line is the only copy left once this ack lands.
         $this->logger()->warning(
             'EventStream [Dead-letter discarded] stream={stream} message_id={message_id} type={type} replays={replays} payload={payload}',
             [
@@ -642,16 +519,8 @@ class DlqReplayCommand extends HyperfCommand
     }
 
     /**
-     * Keeps a message on the dead-letter stream: same lineage, moved to the
-     * end, then acked. If the publish fails nothing is acked and the run stops,
-     * so the committed position stays on this message and the next run starts
-     * with it.
-     *
-     * The copy gets a new id from the driver: Redis only accepts a new entry
-     * id above the last one of the stream. The lineage key is what stays, so a
-     * message without one gets its current id written into
-     * `dead_letter.message_id` first; else its copy would look new to this
-     * run and be read again and again.
+     * Re-publishes, then acks: with the counter ack an unacked message is skipped, not kept. The copy
+     * gets a new id (Redis XADD order), so a message without a lineage key gets one first.
      *
      * @param  array{group: string, dead_letter_stream: string}  $run
      */
@@ -677,10 +546,6 @@ class DlqReplayCommand extends HyperfCommand
         return true;
     }
 
-    /**
-     * The id of the first failed message; it stays the same across repeated
-     * dead-letter and replay rounds.
-     */
     private function lineageKey(StreamMessage $message): string
     {
         return (string) (

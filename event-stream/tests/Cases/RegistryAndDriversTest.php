@@ -34,10 +34,6 @@ use ReflectionProperty;
 use Symfony\Component\Serializer\Serializer;
 
 /**
- * The small additions the replay command relies on outside the command:
- * the registry, the Kafka consumer factory and earliest-offset consumer, and
- * the Redis group read position.
- *
  * @internal
  * @coversNothing
  *
@@ -85,10 +81,6 @@ class RegistryAndDriversTest extends AbstractTestCase
         $registry->init();
     }
 
-    /**
-     * Building a Kafka consumer joins the group, so close() must not build one
-     * just to leave it.
-     */
     public function testClosingAConsumerThatWasNeverBuiltDoesNothing(): void
     {
         $factory = new ConsumerFactory($this->config);
@@ -116,12 +108,6 @@ class RegistryAndDriversTest extends AbstractTestCase
         );
     }
 
-    /**
-     * longlang/phpkafka starts a new group at offset 0 and, when that offset
-     * is not retained, jumps to the newest message. After a (re)join this
-     * consumer asks for the EARLIEST offsets (timestamp -2) and moves a
-     * position that is not retained up to it; a retained one stays.
-     */
     public function testTheConsumerMovesANotRetainedPositionToTheEarliestOffset(): void
     {
         $requests = [];
@@ -145,7 +131,6 @@ class RegistryAndDriversTest extends AbstractTestCase
         $offsetManager = new OffsetManager($broker, 1, 'user-events.billing-service.dlq', [0, 1], 'billing-service-dlq-replay', null, 'member-1', 1);
         (new ReflectionProperty(OffsetManager::class, 'offsets'))->setValue($offsetManager, [0 => 0, 1 => 7]);
 
-        // Built without the constructor, which would connect to a broker.
         $consumer = (new ReflectionClass(EarliestOffsetConsumer::class))->newInstanceWithoutConstructor();
         (new ReflectionProperty(Consumer::class, 'broker'))->setValue($consumer, $broker);
         (new ReflectionProperty(Consumer::class, 'config'))->setValue($consumer, new ConsumerConfig());
@@ -168,11 +153,6 @@ class RegistryAndDriversTest extends AbstractTestCase
         $this->assertSame(['join', 'seek'], $consumer->calls);
     }
 
-    /**
-     * The join started the heartbeat; a failed seek must not leave a joined
-     * member with a live timer. It is rethrown, not swallowed: falling back to
-     * the library position could jump to the newest message.
-     */
     public function testAFailedSeekStopsTheHeartbeatLeavesTheGroupAndRethrows(): void
     {
         $consumer = (new ReflectionClass(RecordingEarliestOffsetConsumer::class))->newInstanceWithoutConstructor();
@@ -188,10 +168,6 @@ class RegistryAndDriversTest extends AbstractTestCase
         $this->assertSame(['join', 'seek', 'stop-heartbeat', 'close'], $consumer->calls);
     }
 
-    /**
-     * `getBrokerIdByTopic()` gives the metadata leader id, -1 for a partition
-     * without a leader. That partition keeps its position; the others seek.
-     */
     public function testAPartitionWithoutALeaderIsSkipped(): void
     {
         $requests = [];
@@ -227,11 +203,6 @@ class RegistryAndDriversTest extends AbstractTestCase
         $this->assertSame([0], array_map(static fn ($p): int => $p->getPartitionIndex(), $requests[0]->getTopics()[0]->getPartitions()));
     }
 
-    /**
-     * The dead letters are written before the replay group exists, so on Redis
-     * that group must start at the beginning of the stream whatever
-     * `read_from` says.
-     */
     public function testARedisGroupCanStartAtTheBeginningOfTheStream(): void
     {
         $redis = Mockery::mock(RedisProxy::class);

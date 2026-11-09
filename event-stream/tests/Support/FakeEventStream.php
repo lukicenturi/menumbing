@@ -10,15 +10,6 @@ use Menumbing\Contract\EventStream\StreamMessage;
 use RuntimeException;
 
 /**
- * An in-memory stream with the one Kafka trait the consumer and the replay
- * command depend on: a message that is not acked comes back on the next
- * subscribe(). Publishing to a stream appends to it, so a message re-parked on
- * the dead-letter stream is read again too.
- *
- * `$pending` stands in for the Redis pending entries list: getIdleMessages()
- * hands those back until they are acked, with the `owner` context that
- * RedisStream adds.
- *
  * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 final class FakeEventStream implements StreamInterface
@@ -44,10 +35,8 @@ final class FakeEventStream implements StreamInterface
     /** @var list<string> publish() throws for messages bound to these streams. */
     public array $failPublishTo = [];
 
-    /** ack() throws when set. */
     public bool $failAck = false;
 
-    /** subscribe() throws on its first round when set, like a broker that is down. */
     public bool $failFirstSubscribe = false;
 
     private int $sequence = 0;
@@ -107,7 +96,6 @@ final class FakeEventStream implements StreamInterface
     public function getIdleMessages(string $consumer, string $group, array $streams, int $retryAfter): Generator
     {
         foreach ($streams as $stream) {
-            // One entry per call, like RedisStream (XPENDING with a count of 1).
             if (null !== $message = $this->pending[$stream][0] ?? null) {
                 yield $stream => $message->withContext(['retry_count' => 1, 'owner' => 'consumer-that-crashed']);
             }

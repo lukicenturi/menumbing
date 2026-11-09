@@ -34,10 +34,6 @@ class RedisStream implements StreamInterface
         $this->id = $this->id ?? new DefaultRedisId();
     }
 
-    /**
-     * @param  ReadMessageFrom|null  $readFrom  Overrides the `read_from` option for this group, e.g. for a group that
-     *                                          must read entries written before it existed.
-     */
     public function createGroup(string $name, string $stream, ?ReadMessageFrom $readFrom = null): bool
     {
         if ($this->hasGroup($name, $stream)) {

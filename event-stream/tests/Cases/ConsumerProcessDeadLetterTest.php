@@ -37,13 +37,6 @@ use Symfony\Component\Serializer\Serializer;
 use function Hyperf\Coroutine\run;
 
 /**
- * The retry and dead-letter path of the consumer process.
- *
- * On Kafka the driver never redelivers a failed message, so before this path
- * one listener exception was a silent, permanent loss. The guarantees pinned
- * here: a failure is retried in place, a message that still fails is copied
- * to the dead-letter stream, and every message is acked exactly once.
- *
  * @internal
  * @coversNothing
  *
@@ -65,7 +58,6 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertSame(3, $options->maxAttempts);
         $this->assertSame(500, $options->backoffMs);
         $this->assertSame(5000, $options->maxBackoffMs);
-        // Scoped to the group: the source is a fan-out stream other groups read too.
         $this->assertSame(self::DLQ, $options->streamFor(self::STREAM, self::GROUP));
     }
 
@@ -111,7 +103,6 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
             static fn (StreamMessage $m): int => $m->context['retry_count'],
             $process->handled,
         ));
-        // 500 ms, then doubled.
         $this->assertSame([500, 1000], $process->pauses);
     }
 
@@ -133,10 +124,8 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $copy = $published[0];
         $this->assertSame('user.created', $copy->type);
         $this->assertSame($original->data, $copy->data);
-        // The producer's own context travels with the copy; the attempt counter does not.
         $this->assertSame('7b3e0f4c-2a91-4d6e-b8f5-0c1d2e3f4a5b', $copy->context['trace_id']);
         $this->assertArrayNotHasKey('retry_count', $copy->context);
-        // The driver gives the copy a new id; the source id is in the context.
         $this->assertNotSame(self::MESSAGE_ID, $copy->id);
 
         $deadLetter = $copy->context['dead_letter'];
@@ -176,10 +165,6 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertSame([self::MESSAGE_ID], $this->stream->ackedIds());
     }
 
-    /**
-     * `#[ConsumedEvent(retries: n)]` makes ConsumerEventHandler answer NACK
-     * instead of throwing. That spends the same budget, and max_attempts wins.
-     */
     public function testNackSpendsTheSameAttemptBudget(): void
     {
         $process = $this->process(static fn (): Result => Result::NACK);
@@ -193,11 +178,6 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertSame([self::MESSAGE_ID], $this->stream->ackedIds());
     }
 
-    /**
-     * Not acking would not keep the message on Kafka: the ack is a counter
-     * per partition, so the failed message would be skipped anyway and a good
-     * one redelivered in its place. The critical log line is the copy.
-     */
     public function testAFailedDeadLetterPublishIsAckedAndLoggedWithTheFullPayload(): void
     {
         $this->stream->failPublishTo = [self::DLQ];
@@ -215,15 +195,10 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertCount(1, $critical);
         $this->assertStringContainsString('EventStream [Dead-letter publish failed]', $critical[0]);
         $this->assertStringContainsString('publish_error=Broker refused ' . self::DLQ, $critical[0]);
-        // The whole message, ready to publish by hand.
         $this->assertStringContainsString('"userId":"0c8a6f2e-5b41-4e3d-9f7a-2d6b1c4e8a90"', $critical[0]);
         $this->assertStringContainsString('"dead_letter":{"source_stream":"user-events"', $critical[0]);
     }
 
-    /**
-     * The payload line is written before the ack, so an ack that throws
-     * cannot take the last copy of the message with it.
-     */
     public function testThePayloadIsLoggedEvenWhenTheAckAfterAFailedPublishThrows(): void
     {
         $this->stream->failPublishTo = [self::DLQ];
@@ -253,7 +228,6 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
 
         $process->consume($this->message());
 
-        // One attempt, no ack, no copy: exactly what the process did before.
         $this->assertCount(1, $process->handled);
         $this->assertSame([], $process->pauses);
         $this->assertSame([], $this->stream->published);
@@ -302,17 +276,12 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertSame(self::DLQ, DeadLetterStream::nameFor(self::STREAM, self::GROUP, ''));
     }
 
-    /**
-     * With `concurrent` > 1 every message runs in its own coroutine. All retry
-     * state is local, so each message gets its own budget and one ack.
-     */
     public function testAConcurrentBatchRetriesAndAcksEachMessageOnce(): void
     {
         $failures = [];
         $process = $this->process(static function (int $call, StreamMessage $message) use (&$failures): Result {
             $failures[$message->id] = ($failures[$message->id] ?? 0) + 1;
 
-            // `a` succeeds at once, `b` on its second attempt, `c` never.
             return match ($message->id) {
                 'a' => Result::ACK,
                 'b' => $failures['b'] < 2 ? Result::NACK : Result::ACK,
@@ -338,11 +307,6 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertSame('c', $dead[0]->context['dead_letter']['message_id']);
     }
 
-    /**
-     * A listener of DeadLettered that throws must not leave the original
-     * unacked: that would shift the Kafka counter by one. It is logged, not
-     * rethrown: a rethrow would reach the subscribe loop as `Subscribe failed`.
-     */
     public function testAThrowingDeadLetteredListenerIsLoggedAndTheOriginalAcked(): void
     {
         $this->container->set(EventDispatcherInterface::class, new class implements EventDispatcherInterface {
@@ -366,10 +330,6 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertStringContainsString('EventStream [Dead-lettered listener failed] event=' . DeadLettered::class, $errors[0]);
     }
 
-    /**
-     * A throwing ConsumeFailed listener on the first attempt must not leave
-     * processMessage() early: the message is still retried and acked.
-     */
     public function testAThrowingConsumeFailedListenerDoesNotEscapeOrSkipTheAck(): void
     {
         $this->container->set(EventDispatcherInterface::class, new class implements EventDispatcherInterface {
@@ -415,14 +375,9 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertCount(3, $process->handled);
         $this->assertCount(1, $this->stream->publishedTo(self::DLQ));
         $this->assertSame([self::MESSAGE_ID], $this->stream->ackedIds());
-        // 3 BeforeConsume + 3 ConsumeFailed + 1 DeadLettered.
         $this->assertCount(7, $this->logger->messages('error'));
     }
 
-    /**
-     * With `retries: n` the handler turns a skip-listed exception into a NACK.
-     * It is still deterministic, so it is dead-lettered after 1 attempt.
-     */
     public function testASkipListedExceptionBehindANackIsDeadLetteredAtOnce(): void
     {
         AnnotationCollector::collectClass(UserCreated::class, ConsumedEvent::class, new ConsumedEvent(stream: self::STREAM, name: 'user.created', retries: 2));
@@ -447,11 +402,6 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertSame([self::MESSAGE_ID], $this->stream->ackedIds());
     }
 
-    /**
-     * A bare NACK has no exception, so even a skip list that matches
-     * RuntimeException (the parent of MessageNackedException) does not cut
-     * its retries short.
-     */
     public function testABareNackIsNeverSkipListed(): void
     {
         $this->config->set('event_stream.skip_exceptions', [RuntimeException::class]);
@@ -489,11 +439,6 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertContains(DeadLettered::class, (new DebugListener($this->logger, $this->config))->listen());
     }
 
-    /**
-     * `retries: n` with n >= max_attempts: every attempt answers NACK and
-     * none rethrows. The real error must still reach ConsumeFailed and the
-     * dead letter, not a bare "handler returned NACK".
-     */
     public function testARetriesBudgetAboveMaxAttemptsKeepsTheRealError(): void
     {
         AnnotationCollector::collectClass(UserCreated::class, ConsumedEvent::class, new ConsumedEvent(stream: self::STREAM, name: 'user.created', retries: 5));
@@ -532,10 +477,6 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertSame(MessageNackedException::class, $this->stream->publishedTo(self::DLQ)[0]->context['dead_letter']['error']['class']);
     }
 
-    /**
-     * The disabled path keeps its counter: a NACK leaves the message unacked,
-     * and the next delivery of the same id carries the next retry_count.
-     */
     public function testDisabledKeepsCountingNacksPerMessage(): void
     {
         $this->config->set('event_stream.consumer.dead_letter.enabled', false);
@@ -553,11 +494,6 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertSame([], $process->pauses);
     }
 
-    /**
-     * When the DeadLettered listener throws and then the ack throws as well,
-     * the error line about the listener exists already: the ack failure
-     * cannot hide where the message went.
-     */
     public function testAThrowingDeadLetteredListenerIsLoggedEvenWhenTheAckThrows(): void
     {
         $this->container->set(EventDispatcherInterface::class, new class implements EventDispatcherInterface {
@@ -588,10 +524,6 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
         $this->assertStringContainsString('error=Listener broke', $errors[0]);
     }
 
-    /**
-     * RedisStream adds `owner` to an entry it claims back; that describes the
-     * delivery, not the message, so the dead letter does not carry it.
-     */
     public function testTheRedisOwnerIsNotCopiedToTheDeadLetter(): void
     {
         $process = $this->process(static fn (): Result => Result::NACK);

@@ -7,11 +7,6 @@ namespace Menumbing\EventStream\Exception;
 use RuntimeException;
 
 /**
- * Stands in for the real error when the handler answered NACK instead of
- * throwing. ConsumerEventHandler does that while the event's
- * `#[ConsumedEvent(retries: n)]` budget is not used up, and it swallows the
- * exception when it does, so this is all that is left to report.
- *
  * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 final class MessageNackedException extends RuntimeException

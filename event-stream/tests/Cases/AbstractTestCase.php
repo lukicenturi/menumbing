@@ -26,10 +26,6 @@ use Symfony\Component\Serializer\Normalizer\ObjectNormalizer;
 use Symfony\Component\Serializer\Serializer;
 
 /**
- * A real DI container with the shipped config, an in-memory stream as the
- * `default` driver and spies for the dispatcher and the stdout logger. No
- * broker is needed.
- *
  * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 abstract class AbstractTestCase extends TestCase
@@ -66,8 +62,6 @@ abstract class AbstractTestCase extends TestCase
         $this->events = new SpyEventDispatcher();
         $this->logger = new SpyStdoutLogger();
 
-        // StreamFactory is final and builds drivers from config; the fake is
-        // put into its cache, so every caller gets it for `default`.
         $streamFactory = new StreamFactory($this->config, new SerializerFactory($this->config));
         (new ReflectionProperty(StreamFactory::class, 'streams'))->setValue($streamFactory, ['default' => $this->stream]);
 

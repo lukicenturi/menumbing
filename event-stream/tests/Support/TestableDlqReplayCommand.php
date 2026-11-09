@@ -9,10 +9,6 @@ use Menumbing\Contract\EventStream\StreamMessage;
 use Menumbing\EventStream\Command\DlqReplayCommand;
 
 /**
- * The real command with its process-wide side effects replaced: the local
- * handler is scripted, and the runtime boot and timer clear are recorded
- * instead of run.
- *
  * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 final class TestableDlqReplayCommand extends DlqReplayCommand

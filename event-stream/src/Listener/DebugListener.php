@@ -54,8 +54,6 @@ final class DebugListener implements ListenerInterface
 
     public function process(object $event): void
     {
-        // Logged whatever `event_stream.debug` says: this line is the only
-        // signal that a message left the live stream and needs a replay.
         if ($event instanceof DeadLettered) {
             $this->logDeadLetteredEvent($event);
 

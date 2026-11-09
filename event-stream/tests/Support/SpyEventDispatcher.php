@@ -7,8 +7,6 @@ namespace Menumbing\EventStream\Tests\Support;
 use Psr\EventDispatcher\EventDispatcherInterface;
 
 /**
- * Records what was dispatched and runs no listeners.
- *
  * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 final class SpyEventDispatcher implements EventDispatcherInterface

@@ -47,11 +47,6 @@ class ConsumerFactory
         unset($this->consumers[$this->getCacheKey($poolName, $options)]);
     }
 
-    /**
-     * Leaves the group and stops the heartbeat of a consumer that get()
-     * already built, then forgets it. Does nothing for one that does not
-     * exist: building it here would join the group only to leave it.
-     */
     public function close(string $poolName, array $options): void
     {
         $cacheKey = $this->getCacheKey($poolName, $options);
@@ -65,10 +60,6 @@ class ConsumerFactory
     }
 
     /**
-     * `offset_reset => 'earliest'` selects EarliestOffsetConsumer: a position
-     * that retention already deleted moves to the earliest retained message,
-     * not to the newest one (the longlang/phpkafka default).
-     *
      * @return class-string<Consumer>
      */
     protected function getConsumerClass(array $options): string

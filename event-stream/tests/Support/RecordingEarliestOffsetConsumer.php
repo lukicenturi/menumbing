@@ -8,11 +8,6 @@ use Menumbing\EventStream\Driver\Kafka\EarliestOffsetConsumer;
 use RuntimeException;
 
 /**
- * EarliestOffsetConsumer with the broker work replaced by a call log, to pin
- * the order of rejoin(): join, then seek, and the clean-up when the seek
- * fails. Build it with ReflectionClass::newInstanceWithoutConstructor(): the
- * real constructor connects to a broker.
- *
  * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 final class RecordingEarliestOffsetConsumer extends EarliestOffsetConsumer

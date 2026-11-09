@@ -7,8 +7,6 @@ namespace Menumbing\EventStream\Tests\Support;
 use Menumbing\EventStream\Annotation\ConsumedEvent;
 
 /**
- * A consumed event class for the tests that run the real ConsumerEventHandler.
- *
  * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 #[ConsumedEvent(stream: 'user-events', name: 'user.created')]

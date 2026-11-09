@@ -96,10 +96,6 @@ abstract class ConsumerProcess extends AbstractProcess
             while (ProcessManager::isRunning()) {
                 $messages = $this->stream->getIdleMessages($consumerName, $this->groupName, [$this->streamName], $retryAfter);
 
-                // Same guard as the subscribe loop below: a throw out of
-                // processMessage() (an ack failure, for example) must not end
-                // this coroutine, or pending entries would never be reclaimed
-                // again until restart.
                 try {
                     foreach ($messages as $message) {
                         $this->processMessage($message);
@@ -140,38 +136,8 @@ abstract class ConsumerProcess extends AbstractProcess
     }
 
     /**
-     * Handles one message: retried in place, then dead-lettered.
-     *
-     * A failed message is never handed back by the Kafka driver: its
-     * `getIdleMessages()` yields nothing, and the next ack of any later
-     * message commits the offset past the failed one. Without the loop below,
-     * one exception in a listener was a silent, permanent loss on Kafka.
-     *
-     * So a message is retried here, with an exponential pause, up to
-     * `dead_letter.max_attempts` times. A message that still fails is copied
-     * to `<stream>.<group><suffix>` with a `dead_letter` block in its context,
-     * and only then acked, so it can be replayed with `event-stream:dlq-replay`.
-     *
-     * Every message is acked exactly once, whatever happens to it. With the
-     * longlang/phpkafka client an ack is not a per-message mark: `ack()` is
-     * `OffsetManager::addFetchOffset(partition, +1)` plus a commit, a counter
-     * per partition, whichever message it names. A message that is never acked
-     * is not redelivered; the counter only lags by one, so the failed message
-     * is skipped all the same and the last message of the batch is fetched
-     * again as a duplicate.
-     *
-     * With `concurrent` > 1, processBatch() runs this method once per message
-     * in its own coroutine, so all retry state stays local to this call and
-     * the acks land in completion order. With the counter-style ack only the
-     * number of acks matters, and it is right once the whole batch is done.
-     *
-     * `#[ConsumedEvent(retries: n)]` shares the same budget: the attempt index
-     * goes into `retry_count`, so ConsumerEventHandler answers NACK while
-     * `retry_count < n` and rethrows after. Either answer counts as one failed
-     * attempt, and `max_attempts` is the ceiling for both. For a NACK, the
-     * exception that the handler caught is used as the failure, so the real
-     * error reaches `ConsumeFailed` and `dead_letter.error` also when
-     * `n >= max_attempts` and no attempt rethrows.
+     * Retries in place, then dead-letters. Every message is acked exactly once: the longlang ack is a
+     * per-partition offset counter, so an unacked message is skipped anyway and the last one re-fetched.
      */
     protected function processMessage(StreamMessage $message): void
     {
@@ -212,14 +178,9 @@ abstract class ConsumerProcess extends AbstractProcess
                 ? $result
                 : (ConsumerEventHandler::takeNackReason() ?? MessageNackedException::afterAttempt($attempts));
 
-            // One `EventStream [Consume failed]` line per failed attempt.
             $this->dispatchGuarded(new ConsumeFailed($consumerName, $this->groupName, $attempt, $this->stream, $this->driverName, $failure), $attempt);
 
-            // A skip-listed exception is deterministic (bad payload, broken
-            // invariant): another attempt would fail the same way. `$failure`
-            // is the real exception also when ConsumerEventHandler turned it
-            // into a NACK (`retries: n`). A bare NACK has no exception to
-            // match, so it is never skipped.
+            // `$failure`, not `$result`: with `retries: n` the handler wraps a skip-listed exception in a NACK.
             if (!$failure instanceof MessageNackedException && $this->skipException($failure)) {
                 break;
             }
@@ -232,12 +193,7 @@ abstract class ConsumerProcess extends AbstractProcess
         $this->deadLetter($message, $attempts, $failure, $options);
     }
 
-    /**
-     * The behaviour before the dead-letter path, kept for
-     * `dead_letter.enabled = false`: one attempt per delivery, a NACK leaves
-     * the message unacked for the driver to hand back, and a skip-listed
-     * exception is acked and dropped.
-     */
+    /** The behaviour before the dead-letter path, for `dead_letter.enabled = false`. */
     protected function processMessageWithoutDeadLetter(StreamMessage $message): void
     {
         $consumerName = $this->getConsumerName();
@@ -249,7 +205,6 @@ abstract class ConsumerProcess extends AbstractProcess
 
         try {
             $result = call_user_func($this->handler(), $this->groupName, $message);
-            // Not used on this path; dropped so the context does not hold it.
             ConsumerEventHandler::takeNackReason();
 
             if (Result::ACK === $result) {
@@ -270,20 +225,13 @@ abstract class ConsumerProcess extends AbstractProcess
         }
     }
 
-    /**
-     * Copies the message to the dead-letter stream, then acks the original.
-     */
     protected function deadLetter(StreamMessage $message, int $attempts, Throwable $failure, DeadLetterOptions $options): void
     {
         $deadLetterStream = $options->streamFor((string) $this->streamName, (string) $this->groupName);
         $context = $message->context;
-        // `owner` is added by RedisStream::getIdleMessages() to a claimed
-        // entry; like `retry_count`, it describes this delivery, not the message.
         unset($context['retry_count'], $context['owner']);
 
-        // No id: the driver gives the copy a new one. Redis only accepts a new
-        // entry id above the last one of the target stream, so the source id
-        // cannot be reused; the source id is kept in `dead_letter.message_id`.
+        // No id: Redis XADD rejects an id below the stream's last; the source id is in `dead_letter.message_id`.
         $copy = new StreamMessage(
             stream: $deadLetterStream,
             type: $message->type,
@@ -307,14 +255,8 @@ abstract class ConsumerProcess extends AbstractProcess
         try {
             $this->stream->publish($copy);
         } catch (Throwable $e) {
-            // Acked anyway. Leaving it unacked would not keep it on Kafka (see
-            // processMessage()): it would still be skipped, and a good message
-            // would be redelivered in its place. So this log line is the last
-            // copy: it carries the full payload, ready to publish to the
-            // dead-letter stream by hand. It is written by the process itself,
-            // not by a listener, so `event_stream.debug` cannot turn it off,
-            // and it is written before the ack, so it exists even if the ack
-            // throws.
+            // Acked anyway: with the counter ack an unacked message is lost all the same. This line is the
+            // last copy, so it is logged here before the ack, not by a listener that `debug` can turn off.
             $this->logger()->critical(
                 'EventStream [Dead-letter publish failed] consumer={consumer} group={group} stream={stream} dead_letter_stream={dead_letter_stream} message_id={message_id} type={type} attempts={attempts} error={error} publish_error={publish_error} payload={payload}',
                 [
@@ -338,9 +280,6 @@ abstract class ConsumerProcess extends AbstractProcess
             return;
         }
 
-        // Not rethrown: the failure is logged before the ack, and a rethrow
-        // after it would only reach the subscribe loop as a misleading
-        // `Subscribe failed`, and drop the rest of the fetched batch.
         $this->dispatchGuarded(
             new DeadLettered(
                 $this->getConsumerName(),
@@ -359,13 +298,7 @@ abstract class ConsumerProcess extends AbstractProcess
     }
 
     /**
-     * Dispatches an event of the retry and dead-letter path, and logs a
-     * listener that throws instead of letting it out.
-     *
-     * These events are for observation. A throw out of a listener must not
-     * leave processMessage() early: that would skip the ack and the dead
-     * letter, which is the silent loss this path exists to prevent. The log
-     * line is written before anything else happens to the message.
+     * Logs a throwing listener, so it cannot skip the ack or the dead letter.
      *
      * @param  array<string, string>  $extra
      */
@@ -402,11 +335,6 @@ abstract class ConsumerProcess extends AbstractProcess
         return DeadLetterOptions::fromConfig($this->config);
     }
 
-    /**
-     * Coroutine-aware under the sleep hook (SWOOLE_HOOK_SLEEP), so a pause
-     * blocks this message only. Kafka heartbeats run on a timer and keep going
-     * meanwhile.
-     */
     protected function pause(int $milliseconds): void
     {
         if ($milliseconds > 0) {

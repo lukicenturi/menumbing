@@ -43,12 +43,6 @@ class KafkaStream implements StreamInterface
         $this->consumerName = $consumerName;
     }
 
-    /**
-     * `'earliest'` makes the consumers of this stream start at the earliest
-     * retained message when their position is no longer retained (see
-     * EarliestOffsetConsumer). Null keeps the driver option `offset_reset`,
-     * or the client default, which jumps to the newest message.
-     */
     public function setOffsetReset(?string $offsetReset): void
     {
         $this->offsetReset = $offsetReset;
@@ -163,11 +157,6 @@ class KafkaStream implements StreamInterface
         return count($ids) === $count;
     }
 
-    /**
-     * Leaves the consumer group of a subscription, so that a static member
-     * does not hold its partitions until the session timeout. For short-lived
-     * consumers such as a console command; a consumer process never leaves.
-     */
     public function leaveGroup(string $group, array $streams): void
     {
         $this->consumerFactory->close($this->options['pool'] ?? 'default', $this->getConsumerOptions($group, $streams));

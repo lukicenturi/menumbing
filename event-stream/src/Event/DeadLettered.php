@@ -8,10 +8,6 @@ use Menumbing\Contract\EventStream\StreamMessage;
 use Throwable;
 
 /**
- * A consumed message used up its attempts and a copy of it is now on the
- * dead-letter stream. Dispatched after the copy is published and before the
- * original is acked.
- *
  * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 final class DeadLettered

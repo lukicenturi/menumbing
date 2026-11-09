@@ -10,9 +10,6 @@ use Menumbing\EventStream\Consumer\ConsumerProcess;
 use Psr\Container\ContainerInterface;
 
 /**
- * The real retry and dead-letter logic with a scripted handler. Pauses are
- * recorded instead of slept.
- *
  * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 final class TestableConsumerProcess extends ConsumerProcess
