@@ -54,7 +54,7 @@ return [
     'consumer' => [
         'processes' => [], // Array of process configurations for different streams
         'block_for' => 1, // The number of seconds to sleep between processing batches
-        'retry_after' => 60, // The number of seconds to retry zombie message due to offline consumer or failed process
+        'retry_after' => 60, // Redis only: the number of seconds after which a pending message of a stopped consumer is claimed again
 
         // Retry in place and dead-letter queue, see "Retry and dead-letter queue" below
         'dead_letter' => [
@@ -170,7 +170,7 @@ It will automatically create a consumer process for each stream. The option `ret
         'user-events' => 2, // This will create 2 processes for 'user-events' stream
     ],
     'block_for' => 1, // The number of seconds to sleep between processing batches of messages.
-    'retry_after' => 30, // The number of seconds to retry zombie message due to offline consumer or failed process.
+    'retry_after' => 30, // Redis only: the number of seconds after which a pending message of a stopped consumer is claimed again.
 ],
 ```
 
@@ -251,6 +251,9 @@ was a silent and permanent loss of the message on Kafka.
    `EventStream [Dead-letter publish failed] ... payload=...` at `critical`
    level, and then acks the original. This line contains the full message as
    JSON. It is the last copy of the message.
+7. If a `DeadLettered` listener throws, the consumer logs
+   `EventStream [Dead-lettered listener failed] ...` at `error` level, acks
+   the original, and then throws the listener exception again.
 
 The consumer acks every message exactly 1 time. With longlang/phpkafka an ack
 is not a mark on 1 message: it adds 1 to the fetch offset of the partition and
@@ -259,11 +262,15 @@ back. The offset only stays 1 behind, and the last message of the batch comes
 back as a duplicate.
 
 `#[ConsumedEvent(retries: n)]` continues to work. The handler NACK budget and
-the attempt budget are 1 budget, and `max_attempts` is the limit.
+the attempt budget are 1 budget, and `max_attempts` is the limit. When the
+handler answers NACK, the consumer uses the exception that the handler caught
+as the failure. Thus the real error goes to `ConsumeFailed` and to
+`dead_letter.error`, also when `n` >= `max_attempts`.
 `concurrent` > 1 also works: each message has its own attempts.
 
 The Redis driver keeps its pending-entry redelivery for a consumer that stops
-before an ack.
+before an ack. `retry_after` now applies only to that case, because the
+consumer acks every message that it finishes.
 
 ### Configuration
 
@@ -316,8 +323,21 @@ The command does not publish to `<stream>`: other groups read that stream, and
 a copy there would run again in each of them.
 
 The command reads the dead-letter stream with the group `<group>-dlq-replay`.
-A new group starts at the first retained message, so the first run reads the
-full dead-letter stream. Each later run starts after the last acked message.
+Each run starts after the last message that a real run acked.
+
+The start position of the first run:
+
+- Kafka: longlang/phpkafka starts a new group at offset 0. When retention has
+  already deleted that offset, the client goes to the newest message and skips
+  every older dead letter. To prevent this, the command reads with the Kafka
+  consumer option `offset_reset => 'earliest'`: a position that is not
+  retained moves to the earliest retained message.
+- Redis: the command creates the replay group at the start of the stream.
+
+Retention still applies. A dead letter that the broker deletes before a real
+run is lost, so run the first real replay before the oldest dead letter
+expires. A dry run does not commit a position, so it does not keep a dead
+letter on the stream.
 
 For each message:
 
@@ -372,13 +392,23 @@ and register it as a command of your application.
 
 ### Breaking change
 
-The dead-letter path is on by default. Two things change for an existing
+The dead-letter path is on by default. These things change for an existing
 application:
 
 - A message that fails all attempts goes to `<stream>.<group>.dlq`. Create the
   dead-letter topics before you deploy, unless the broker creates them.
 - An exception in `skip_exceptions` sends the message to the dead-letter
   stream. Before, the consumer acked it and dropped it.
+- Redis: `#[ConsumedEvent(retries: n)]` used to mean n redeliveries through
+  the pending list, spaced by `retry_after` (default 60 seconds). Now it means
+  at most `max_attempts` attempts about 1.5 seconds apart, then the
+  dead-letter stream. An outage of 2 minutes that the consumer rode out before
+  now sends the messages of that period to the dead-letter stream. Replay
+  them, or increase `max_attempts` and `max_backoff_ms`.
+- Redis: a NACK no longer leaves the entry pending for `retry_after`. The
+  consumer acks the message after the last attempt. `retry_after` now matters
+  only for a consumer that stops in the middle of a message.
+- The package now requires `hyperf/command` and `hyperf/context`.
 
 Set `event_stream.consumer.dead_letter.enabled` to `false` to get the previous
 behaviour.

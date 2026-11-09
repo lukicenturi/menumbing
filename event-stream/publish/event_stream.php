@@ -59,6 +59,11 @@ return [
                  *   Recommended: 200–400ms when wait_time is 500–1000ms.
                  *   Default (Kafka): 500ms.
                  *
+                 * - offset_reset: 'earliest' makes a consumer whose position is no longer retained start
+                 *   at the earliest retained message. Without it, the client jumps to the newest message
+                 *   and skips the older ones. The dlq-replay command always uses 'earliest'.
+                 *   Default: not set (client behaviour).
+                 *
                  * Example:
                  *   'min_bytes' => 512,
                  *   'max_wait'  => 300,
@@ -79,8 +84,10 @@ return [
      * - block_for: The number of seconds to sleep between processing batches of messages.
      * This helps control the consumption rate and system resources.
      *
-     * - retry_after: Time in seconds after which pending messages are considered
-     *               for reprocessing if not acknowledged
+     * - retry_after: Time in seconds after which a pending (unacknowledged) message is claimed again. Redis driver
+     *               only. With `dead_letter.enabled` (the default) the consumer acks every message it finishes,
+     *               also a failed one, so this only matters for a consumer that stops (crash, kill) in the middle
+     *               of a message. With `dead_letter.enabled` false, a NACK leaves the message pending until then.
      */
     'consumer' => [
         'processes' => [
@@ -123,6 +130,11 @@ return [
          * so they must be idempotent.
          *
          * The dead-letter streams must exist on the broker, unless it creates topics automatically.
+         *
+         * On Redis this replaces the slow redelivery: `#[ConsumedEvent(retries: n)]` used to mean n redeliveries
+         * spaced by `retry_after` (60 s by default) through the pending list. Now it is at most `max_attempts`
+         * attempts about 1.5 s apart, then the dead-letter stream. An outage of a few minutes that the old
+         * behaviour rode out now dead-letters the messages; replay them, or raise the budget.
          *
          * - enabled: false restores the behaviour before the dead-letter path: one attempt per delivery, and a
          *   skip-listed exception is acked and dropped. Note that the Kafka driver never redelivers a failed message.
