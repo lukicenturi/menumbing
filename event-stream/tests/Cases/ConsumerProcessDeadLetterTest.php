@@ -1,23 +1,18 @@
 <?php
 
 declare(strict_types=1);
-/**
- * This file is part of Hyperf.
- *
- * @link     https://www.hyperf.io
- * @document https://hyperf.wiki
- * @contact  group@hyperf.io
- * @license  https://github.com/hyperf/hyperf/blob/master/LICENSE
- */
+
 namespace Menumbing\EventStream\Tests\Cases;
 
 use Closure;
 use DateTimeImmutable;
 use DomainException;
 use Generator;
+use Hyperf\Context\Context;
+use Hyperf\Di\Annotation\AnnotationCollector;
 use InvalidArgumentException;
-use Psr\EventDispatcher\EventDispatcherInterface;
 use Menumbing\Contract\EventStream\StreamMessage;
+use Menumbing\EventStream\Annotation\ConsumedEvent;
 use Menumbing\EventStream\DeadLetter\DeadLetterOptions;
 use Menumbing\EventStream\DeadLetter\DeadLetterStream;
 use Menumbing\EventStream\Enum\Result;
@@ -25,12 +20,19 @@ use Menumbing\EventStream\Event\AfterConsume;
 use Menumbing\EventStream\Event\BeforeConsume;
 use Menumbing\EventStream\Event\ConsumeFailed;
 use Menumbing\EventStream\Event\DeadLettered;
+use Menumbing\EventStream\EventRegistry;
 use Menumbing\EventStream\Exception\MessageNackedException;
+use Menumbing\EventStream\Handler\ConsumerEventHandler;
 use Menumbing\EventStream\Listener\DebugListener;
 use Menumbing\EventStream\Tests\Support\SpyStdoutLogger;
 use Menumbing\EventStream\Tests\Support\TestableConsumerProcess;
+use Menumbing\EventStream\Tests\Support\UserCreated;
+use Psr\EventDispatcher\EventDispatcherInterface;
 use ReflectionMethod;
 use RuntimeException;
+use Symfony\Component\Serializer\Encoder\JsonEncoder;
+use Symfony\Component\Serializer\Normalizer\ObjectNormalizer;
+use Symfony\Component\Serializer\Serializer;
 
 use function Hyperf\Coroutine\run;
 
@@ -44,6 +46,8 @@ use function Hyperf\Coroutine\run;
  *
  * @internal
  * @coversNothing
+ *
+ * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 class ConsumerProcessDeadLetterTest extends AbstractTestCase
 {
@@ -388,6 +392,120 @@ class ConsumerProcessDeadLetterTest extends AbstractTestCase
     public function testTheDebugListenerListensToDeadLettered(): void
     {
         $this->assertContains(DeadLettered::class, (new DebugListener($this->logger, $this->config))->listen());
+    }
+
+    /**
+     * `retries: n` with n >= max_attempts: every attempt answers NACK and
+     * none rethrows. The real error must still reach ConsumeFailed and the
+     * dead letter, not a bare "handler returned NACK".
+     */
+    public function testARetriesBudgetAboveMaxAttemptsKeepsTheRealError(): void
+    {
+        AnnotationCollector::collectClass(UserCreated::class, ConsumedEvent::class, new ConsumedEvent(stream: self::STREAM, name: 'user.created', retries: 5));
+        $registry = new EventRegistry();
+        $registry->init();
+        $listeners = new class implements EventDispatcherInterface {
+            public function dispatch(object $event): object
+            {
+                throw new RuntimeException('Connection to the ledger timed out');
+            }
+        };
+        $handler = new ConsumerEventHandler($listeners, $registry, new Serializer([new ObjectNormalizer()], [new JsonEncoder()]));
+        $process = $this->process(static fn (int $call, StreamMessage $message): Result => $handler(self::GROUP, $message));
+
+        $process->consume($this->message());
+
+        $this->assertCount(3, $process->handled);
+        $failed = $this->events->ofType(ConsumeFailed::class);
+        $this->assertCount(3, $failed);
+        foreach ($failed as $event) {
+            $this->assertSame('Connection to the ledger timed out', $event->exception->getMessage());
+        }
+        $error = $this->stream->publishedTo(self::DLQ)[0]->context['dead_letter']['error'];
+        $this->assertSame(['class' => RuntimeException::class, 'message' => 'Connection to the ledger timed out'], $error);
+        $this->assertSame([self::MESSAGE_ID], $this->stream->ackedIds());
+        $this->assertNull(ConsumerEventHandler::takeNackReason());
+    }
+
+    public function testAStaleNackReasonIsNotTakenForALaterPlainNack(): void
+    {
+        Context::set(ConsumerEventHandler::NACK_REASON, new RuntimeException('Stale'));
+        $process = $this->process(static fn (): Result => Result::NACK);
+
+        $process->consume($this->message());
+
+        $this->assertSame(MessageNackedException::class, $this->stream->publishedTo(self::DLQ)[0]->context['dead_letter']['error']['class']);
+    }
+
+    /**
+     * The disabled path keeps its counter: a NACK leaves the message unacked,
+     * and the next delivery of the same id carries the next retry_count.
+     */
+    public function testDisabledKeepsCountingNacksPerMessage(): void
+    {
+        $this->config->set('event_stream.consumer.dead_letter.enabled', false);
+        $process = $this->process(static fn (int $call): Result => $call < 3 ? Result::NACK : Result::ACK);
+
+        $process->consume($this->message());
+        $process->consume($this->message());
+        $this->assertSame([], $this->stream->ackedIds());
+
+        $process->consume($this->message());
+
+        $this->assertSame([0, 1, 2], array_map(static fn (StreamMessage $m): int => $m->context['retry_count'], $process->handled));
+        $this->assertSame([self::MESSAGE_ID], $this->stream->ackedIds());
+        $this->assertSame([], $this->stream->published);
+        $this->assertSame([], $process->pauses);
+    }
+
+    /**
+     * When the DeadLettered listener throws and then the ack throws as well,
+     * the error line about the listener exists already: the ack failure
+     * cannot hide where the message went.
+     */
+    public function testAThrowingDeadLetteredListenerIsLoggedEvenWhenTheAckThrows(): void
+    {
+        $this->container->set(EventDispatcherInterface::class, new class implements EventDispatcherInterface {
+            public function dispatch(object $event): object
+            {
+                if ($event instanceof DeadLettered) {
+                    throw new RuntimeException('Listener broke');
+                }
+
+                return $event;
+            }
+        });
+        $this->stream->failAck = true;
+        $process = $this->process(static fn (): Result => Result::NACK);
+
+        try {
+            $process->consume($this->message());
+            $this->fail('The ack failure should surface.');
+        } catch (RuntimeException $e) {
+            $this->assertSame('Offset commit failed', $e->getMessage());
+        }
+
+        $this->assertCount(1, $this->stream->publishedTo(self::DLQ));
+        $errors = $this->logger->messages('error');
+        $this->assertCount(1, $errors);
+        $this->assertStringContainsString('EventStream [Dead-lettered listener failed]', $errors[0]);
+        $this->assertStringContainsString('dead_letter_stream=' . self::DLQ . ' message_id=' . self::MESSAGE_ID, $errors[0]);
+        $this->assertStringContainsString('error=Listener broke', $errors[0]);
+    }
+
+    /**
+     * RedisStream adds `owner` to an entry it claims back; that describes the
+     * delivery, not the message, so the dead letter does not carry it.
+     */
+    public function testTheRedisOwnerIsNotCopiedToTheDeadLetter(): void
+    {
+        $process = $this->process(static fn (): Result => Result::NACK);
+
+        $process->consume($this->message()->withContext(['owner' => 'consumer-that-crashed']));
+
+        $copy = $this->stream->publishedTo(self::DLQ)[0];
+        $this->assertArrayNotHasKey('owner', $copy->context);
+        $this->assertSame('7b3e0f4c-2a91-4d6e-b8f5-0c1d2e3f4a5b', $copy->context['trace_id']);
     }
 
     private function process(Closure $script): TestableConsumerProcess

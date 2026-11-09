@@ -1,14 +1,7 @@
 <?php
 
 declare(strict_types=1);
-/**
- * This file is part of Hyperf.
- *
- * @link     https://www.hyperf.io
- * @document https://hyperf.wiki
- * @contact  group@hyperf.io
- * @license  https://github.com/hyperf/hyperf/blob/master/LICENSE
- */
+
 namespace Menumbing\EventStream\Tests\Support;
 
 use Closure;
@@ -19,6 +12,8 @@ use Psr\Container\ContainerInterface;
 /**
  * The real retry and dead-letter logic with a scripted handler. Pauses are
  * recorded instead of slept.
+ *
+ * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 final class TestableConsumerProcess extends ConsumerProcess
 {

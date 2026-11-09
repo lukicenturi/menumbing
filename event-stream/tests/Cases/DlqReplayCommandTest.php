@@ -1,16 +1,11 @@
 <?php
 
 declare(strict_types=1);
-/**
- * This file is part of Hyperf.
- *
- * @link     https://www.hyperf.io
- * @document https://hyperf.wiki
- * @contact  group@hyperf.io
- * @license  https://github.com/hyperf/hyperf/blob/master/LICENSE
- */
+
 namespace Menumbing\EventStream\Tests\Cases;
 
+use Generator;
+use Hyperf\Context\Context;
 use Hyperf\Di\Annotation\AnnotationCollector;
 use Hyperf\Event\ListenerProvider;
 use Hyperf\Process\ProcessManager;
@@ -18,11 +13,16 @@ use Menumbing\Contract\EventStream\StreamMessage;
 use Menumbing\EventStream\Annotation\ConsumedEvent;
 use Menumbing\EventStream\Command\DlqReplayCommand;
 use Menumbing\EventStream\ConfigProvider;
+use Menumbing\EventStream\Driver\Kafka\KafkaStream;
 use Menumbing\EventStream\Enum\Result;
 use Menumbing\EventStream\Exception\MessageNackedException;
+use Menumbing\EventStream\Factory\StreamFactory;
+use Menumbing\EventStream\Handler\ConsumerEventHandler;
 use Menumbing\EventStream\Tests\Support\TestableDlqReplayCommand;
 use Menumbing\EventStream\Tests\Support\UserCreated;
+use Mockery;
 use Psr\EventDispatcher\ListenerProviderInterface;
+use ReflectionProperty;
 use RuntimeException;
 use Symfony\Component\Console\Input\StringInput;
 use Symfony\Component\Console\Output\BufferedOutput;
@@ -38,6 +38,8 @@ use Symfony\Component\Console\Output\BufferedOutput;
  *
  * @internal
  * @coversNothing
+ *
+ * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 class DlqReplayCommandTest extends AbstractTestCase
 {
@@ -52,6 +54,13 @@ class DlqReplayCommandTest extends AbstractTestCase
     private BufferedOutput $output;
 
     private TestableDlqReplayCommand $command;
+
+    protected function tearDown(): void
+    {
+        Mockery::close();
+
+        parent::tearDown();
+    }
 
     protected function setUp(): void
     {
@@ -423,6 +432,105 @@ class DlqReplayCommandTest extends AbstractTestCase
         $this->assertSame([$message->id, 'dlq-2'], $this->stream->ackedIds());
         // The unknown type was kept, not acked away by the handler.
         $this->assertSame(['user.retired-event'], array_map(static fn (StreamMessage $m): string => $m->type, $this->stream->queues[self::DLQ]));
+    }
+
+    /**
+     * A NACK from ConsumerEventHandler (an event with `retries` left) keeps
+     * the exception it caught; the re-parked copy records that, not a bare
+     * "handler returned NACK".
+     */
+    public function testAReplayNackRecordsTheRealError(): void
+    {
+        $this->deadLetter('dlq-1', 'source-1');
+        $this->command->script = static function (): Result {
+            Context::set(ConsumerEventHandler::NACK_REASON, new RuntimeException('Ledger is down'));
+
+            return Result::NACK;
+        };
+
+        $this->assertSame(0, $this->replay('--stream=' . self::SOURCE . ' --idle-seconds=30'));
+
+        $error = $this->stream->queues[self::DLQ][0]->context['dead_letter']['last_replay_error'];
+        $this->assertSame(RuntimeException::class, $error['class']);
+        $this->assertSame('Ledger is down', $error['message']);
+    }
+
+    /**
+     * Kept messages of another group or of an unknown type do not spend the
+     * --limit: it counts replayed and held messages only.
+     */
+    public function testForeignAndUnknownMessagesDoNotSpendTheLimit(): void
+    {
+        $this->command->unknownTypes = ['user.retired-event'];
+        $this->deadLetter('dlq-1', 'source-1', group: 'audit-service');
+        $this->deadLetter('dlq-2', 'source-2', 'user.retired-event');
+        $this->deadLetter('dlq-3', 'source-3');
+        $this->deadLetter('dlq-4', 'source-4');
+
+        $this->assertSame(0, $this->replay('--stream=' . self::SOURCE . ' --limit=1 --idle-seconds=0'));
+
+        $this->assertCount(1, $this->command->dispatched);
+        $this->assertSame('source-3', $this->command->dispatched[0]->context['replayed_from_dlq']['original_message_id']);
+        $text = $this->output->fetch();
+        $this->assertStringContainsString('limit reached (1)', $text);
+        $this->assertMatchesRegularExpression('/Skipped \(other group\)\s*\|?\s*1/', $text);
+        $this->assertMatchesRegularExpression('/Skipped \(unknown type\)\s*\|?\s*1/', $text);
+    }
+
+    public function testFilteredMessagesDoNotSpendTheLimit(): void
+    {
+        $this->deadLetter('dlq-1', 'source-1', 'user.deleted');
+        $this->deadLetter('dlq-2', 'source-2', 'user.deleted');
+        $this->deadLetter('dlq-3', 'source-3');
+        $this->deadLetter('dlq-4', 'source-4');
+
+        $this->assertSame(0, $this->replay('--stream=' . self::SOURCE . ' --type=' . self::TYPE . ' --limit=1 --idle-seconds=0'));
+
+        $this->assertCount(1, $this->command->dispatched);
+        $text = $this->output->fetch();
+        $this->assertStringContainsString('limit reached (1)', $text);
+        $this->assertMatchesRegularExpression('/Skipped \(--type filter\)\s*\|?\s*2/', $text);
+    }
+
+    /**
+     * RedisStream adds `owner` to a claimed entry. It describes that read, so
+     * neither the replayed message nor a re-parked copy carries it.
+     */
+    public function testTheRedisOwnerOfAClaimedEntryIsDropped(): void
+    {
+        $pending = $this->deadLetter('dlq-1', 'source-1');
+        $filtered = $this->deadLetter('dlq-2', 'source-2', 'user.deleted');
+        $this->stream->queues[self::DLQ] = [];
+        $this->stream->pending[self::DLQ] = [$pending, $filtered];
+
+        $this->assertSame(0, $this->replay('--stream=' . self::SOURCE . ' --type=' . self::TYPE . ' --idle-seconds=0'));
+
+        $this->assertCount(1, $this->command->dispatched);
+        $this->assertArrayNotHasKey('owner', $this->command->dispatched[0]->context);
+        $parked = $this->stream->publishedTo(self::DLQ);
+        $this->assertCount(1, $parked);
+        $this->assertArrayNotHasKey('owner', $parked[0]->context);
+    }
+
+    /**
+     * On Kafka the replay consumer must start at the earliest retained dead
+     * letter, not at the newest one, when its position is no longer retained.
+     */
+    public function testAKafkaReplayReadsWithTheEarliestOffsetReset(): void
+    {
+        $kafka = Mockery::mock(KafkaStream::class);
+        $kafka->shouldReceive('setOffsetReset')->once()->with('earliest')->ordered();
+        $kafka->shouldReceive('createGroup')->once()->with(self::REPLAY_GROUP, self::DLQ)->ordered()->andReturn(true);
+        $kafka->shouldReceive('getIdleMessages')->andReturnUsing(static fn (): Generator => yield from []);
+        $kafka->shouldReceive('subscribe')->once()->andReturnUsing(static fn (): Generator => yield from []);
+        $kafka->shouldReceive('leaveGroup')->once()->with(self::REPLAY_GROUP, [self::DLQ]);
+        $factory = $this->container->get(StreamFactory::class);
+        $streams = new ReflectionProperty(StreamFactory::class, 'streams');
+        $streams->setValue($factory, [...$streams->getValue($factory), 'kafka' => $kafka]);
+
+        $this->assertSame(0, $this->replay('--stream=' . self::SOURCE . ' --driver=kafka --idle-seconds=0'));
+
+        $this->assertSame(['leave:' . self::DLQ, 'clear-timers'], $this->command->calls);
     }
 
     private function replay(string $arguments): int

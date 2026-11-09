@@ -1,20 +1,15 @@
 <?php
 
 declare(strict_types=1);
-/**
- * This file is part of Hyperf.
- *
- * @link     https://www.hyperf.io
- * @document https://hyperf.wiki
- * @contact  group@hyperf.io
- * @license  https://github.com/hyperf/hyperf/blob/master/LICENSE
- */
+
 namespace Menumbing\EventStream\Tests\Support;
 
 use Psr\EventDispatcher\EventDispatcherInterface;
 
 /**
  * Records what was dispatched and runs no listeners.
+ *
+ * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 final class SpyEventDispatcher implements EventDispatcherInterface
 {

@@ -1,14 +1,7 @@
 <?php
 
 declare(strict_types=1);
-/**
- * This file is part of Hyperf.
- *
- * @link     https://www.hyperf.io
- * @document https://hyperf.wiki
- * @contact  group@hyperf.io
- * @license  https://github.com/hyperf/hyperf/blob/master/LICENSE
- */
+
 namespace Menumbing\EventStream\Tests\Support;
 
 use Generator;
@@ -23,7 +16,10 @@ use RuntimeException;
  * the dead-letter stream is read again too.
  *
  * `$pending` stands in for the Redis pending entries list: getIdleMessages()
- * hands those back until they are acked.
+ * hands those back until they are acked, with the `owner` context that
+ * RedisStream adds.
+ *
+ * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 final class FakeEventStream implements StreamInterface
 {
@@ -113,7 +109,7 @@ final class FakeEventStream implements StreamInterface
         foreach ($streams as $stream) {
             // One entry per call, like RedisStream (XPENDING with a count of 1).
             if (null !== $message = $this->pending[$stream][0] ?? null) {
-                yield $stream => $message->withContext(['retry_count' => 1]);
+                yield $stream => $message->withContext(['retry_count' => 1, 'owner' => 'consumer-that-crashed']);
             }
         }
     }

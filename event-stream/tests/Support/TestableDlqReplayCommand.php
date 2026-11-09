@@ -1,14 +1,7 @@
 <?php
 
 declare(strict_types=1);
-/**
- * This file is part of Hyperf.
- *
- * @link     https://www.hyperf.io
- * @document https://hyperf.wiki
- * @contact  group@hyperf.io
- * @license  https://github.com/hyperf/hyperf/blob/master/LICENSE
- */
+
 namespace Menumbing\EventStream\Tests\Support;
 
 use Closure;
@@ -19,6 +12,8 @@ use Menumbing\EventStream\Command\DlqReplayCommand;
  * The real command with its process-wide side effects replaced: the local
  * handler is scripted, and the runtime boot and timer clear are recorded
  * instead of run.
+ *
+ * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 final class TestableDlqReplayCommand extends DlqReplayCommand
 {

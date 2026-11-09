@@ -1,14 +1,7 @@
 <?php
 
 declare(strict_types=1);
-/**
- * This file is part of Hyperf.
- *
- * @link     https://www.hyperf.io
- * @document https://hyperf.wiki
- * @contact  group@hyperf.io
- * @license  https://github.com/hyperf/hyperf/blob/master/LICENSE
- */
+
 namespace Menumbing\EventStream\Tests\Cases;
 
 use Hyperf\Config\Config;
@@ -36,6 +29,8 @@ use Symfony\Component\Serializer\Serializer;
  * A real DI container with the shipped config, an in-memory stream as the
  * `default` driver and spies for the dispatcher and the stdout logger. No
  * broker is needed.
+ *
+ * @author  Luki Centuri <lukicenturi@gmail.com>
  */
 abstract class AbstractTestCase extends TestCase
 {
