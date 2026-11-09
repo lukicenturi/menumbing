@@ -18,6 +18,7 @@ use Menumbing\EventStream\Event\ConsumerGroupCreated;
 use Menumbing\EventStream\Event\ConsumerGroupCreateFailed;
 use Menumbing\EventStream\Event\ConsumerStarted;
 use Menumbing\EventStream\Event\ConsumerStopped;
+use Menumbing\EventStream\Event\DeadLettered;
 use Menumbing\EventStream\Event\ProduceEvent;
 use Menumbing\EventStream\Event\ProduceFailed;
 use Menumbing\EventStream\Event\SubscribeFailed;
@@ -47,11 +48,20 @@ final class DebugListener implements ListenerInterface
             BeforeProduce::class,
             AfterProduce::class,
             ProduceFailed::class,
+            DeadLettered::class,
         ];
     }
 
     public function process(object $event): void
     {
+        // Logged whatever `event_stream.debug` says: this line is the only
+        // signal that a message left the live stream and needs a replay.
+        if ($event instanceof DeadLettered) {
+            $this->logDeadLetteredEvent($event);
+
+            return;
+        }
+
         if (!$this->config->get('event_stream.debug', true)) {
             return;
         }
@@ -103,6 +113,25 @@ final class DebugListener implements ListenerInterface
                 'driver' => $event->streamDriver,
                 'error' => $event->exception->getMessage(),
                 'exception' => (string) $event->exception,
+            ],
+        );
+    }
+
+    private function logDeadLetteredEvent(DeadLettered $event): void
+    {
+        $this->logger->error(
+            message: 'EventStream [Dead-lettered] consumer={consumer} group={group} stream={stream} dead_letter_stream={dead_letter_stream} message_id={message_id} type={type} attempts={attempts} error={error}',
+            context: [
+                'consumer' => $event->consumerName,
+                'group' => $event->groupName,
+                'stream' => $event->streamName,
+                'dead_letter_stream' => $event->deadLetterStream,
+                'message_id' => (string) $event->message->id,
+                'type' => $event->message->type,
+                'attempts' => $event->attempts,
+                'error' => $event->throwable->getMessage(),
+                'error_class' => $event->throwable::class,
+                'exception' => (string) $event->throwable,
             ],
         );
     }

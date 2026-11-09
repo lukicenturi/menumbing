@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace Menumbing\EventStream\Consumer;
 
+use DateTimeImmutable;
 use Generator;
 use Hyperf\Contract\ConfigInterface;
+use Hyperf\Contract\StdoutLoggerInterface;
 use Hyperf\Coordinator\Constants;
 use Hyperf\Coordinator\CoordinatorManager;
 use Hyperf\Coroutine\Coroutine;
@@ -14,6 +16,7 @@ use Hyperf\Process\AbstractProcess;
 use Hyperf\Process\ProcessManager;
 use Menumbing\Contract\EventStream\StreamInterface;
 use Menumbing\Contract\EventStream\StreamMessage;
+use Menumbing\EventStream\DeadLetter\DeadLetterOptions;
 use Menumbing\EventStream\Enum\Result;
 use Menumbing\EventStream\Event\AfterConsume;
 use Menumbing\EventStream\Event\BeforeConsume;
@@ -22,8 +25,10 @@ use Menumbing\EventStream\Event\ConsumerGroupCreated;
 use Menumbing\EventStream\Event\ConsumerGroupCreateFailed;
 use Menumbing\EventStream\Event\ConsumerStarted;
 use Menumbing\EventStream\Event\ConsumerStopped;
+use Menumbing\EventStream\Event\DeadLettered;
 use Menumbing\EventStream\Event\SubscribeFailed;
 use Menumbing\EventStream\EventRegistry;
+use Menumbing\EventStream\Exception\MessageNackedException;
 use Menumbing\EventStream\Factory\StreamFactory;
 use Psr\Container\ContainerInterface;
 use Throwable;
@@ -125,7 +130,96 @@ abstract class ConsumerProcess extends AbstractProcess
         }
     }
 
+    /**
+     * Handles one message: retried in place, then dead-lettered.
+     *
+     * A failed message is never handed back by the Kafka driver: its
+     * `getIdleMessages()` yields nothing, and the next ack of any later
+     * message commits the offset past the failed one. Without the loop below,
+     * one exception in a listener was a silent, permanent loss on Kafka.
+     *
+     * So a message is retried here, with an exponential pause, up to
+     * `dead_letter.max_attempts` times. A message that still fails is copied
+     * to `<stream>.<group><suffix>` with a `dead_letter` block in its context,
+     * and only then acked, so it can be replayed with `event-stream:dlq-replay`.
+     *
+     * Every message is acked exactly once, whatever happens to it. With the
+     * longlang/phpkafka client an ack is not a per-message mark: `ack()` is
+     * `OffsetManager::addFetchOffset(partition, +1)` plus a commit, a counter
+     * per partition, whichever message it names. A message that is never acked
+     * is not redelivered; the counter only lags by one, so the failed message
+     * is skipped all the same and the last message of the batch is fetched
+     * again as a duplicate.
+     *
+     * With `concurrent` > 1, processBatch() runs this method once per message
+     * in its own coroutine, so all retry state stays local to this call and
+     * the acks land in completion order. With the counter-style ack only the
+     * number of acks matters, and it is right once the whole batch is done.
+     *
+     * `#[ConsumedEvent(retries: n)]` shares the same budget: the attempt index
+     * goes into `retry_count`, so ConsumerEventHandler answers NACK while
+     * `retry_count < n` and rethrows after. Either answer counts as one failed
+     * attempt, and `max_attempts` is the ceiling for both.
+     */
     protected function processMessage(StreamMessage $message): void
+    {
+        $options = $this->deadLetterOptions();
+
+        if (!$options->enabled) {
+            $this->processMessageWithoutDeadLetter($message);
+
+            return;
+        }
+
+        $consumerName = $this->getConsumerName();
+        $attempts = 0;
+        $failure = null;
+
+        while ($attempts < $options->maxAttempts) {
+            $attempt = $message->withContext(['retry_count' => $attempts]);
+            ++$attempts;
+
+            $this->event?->dispatch(new BeforeConsume($consumerName, $this->groupName, $attempt, $this->stream, $this->driverName));
+
+            try {
+                $result = call_user_func($this->handler(), $this->groupName, $attempt);
+            } catch (Throwable $e) {
+                $result = $e;
+            }
+
+            if (Result::ACK === $result) {
+                $this->stream->ack($this->groupName, $this->streamName, [$message->id]);
+                $this->event?->dispatch(new AfterConsume($consumerName, $this->groupName, $attempt, $this->stream, $this->driverName));
+
+                return;
+            }
+
+            $failure = $result instanceof Throwable ? $result : MessageNackedException::afterAttempt($attempts);
+
+            // One `EventStream [Consume failed]` line per failed attempt.
+            $this->event?->dispatch(new ConsumeFailed($consumerName, $this->groupName, $attempt, $this->stream, $this->driverName, $failure));
+
+            // A skip-listed exception is deterministic (bad payload, broken
+            // invariant): another attempt would fail the same way.
+            if ($result instanceof Throwable && $this->skipException($result)) {
+                break;
+            }
+
+            if ($attempts < $options->maxAttempts) {
+                $this->pause($options->backoffAfter($attempts));
+            }
+        }
+
+        $this->deadLetter($message, $attempts, $failure, $options);
+    }
+
+    /**
+     * The behaviour before the dead-letter path, kept for
+     * `dead_letter.enabled = false`: one attempt per delivery, a NACK leaves
+     * the message unacked for the driver to hand back, and a skip-listed
+     * exception is acked and dropped.
+     */
+    protected function processMessageWithoutDeadLetter(StreamMessage $message): void
     {
         $consumerName = $this->getConsumerName();
 
@@ -153,6 +247,110 @@ abstract class ConsumerProcess extends AbstractProcess
 
             $this->event?->dispatch(new ConsumeFailed($consumerName, $this->groupName, $message, $this->stream, $this->driverName, $e));
         }
+    }
+
+    /**
+     * Copies the message to the dead-letter stream, then acks the original.
+     */
+    protected function deadLetter(StreamMessage $message, int $attempts, Throwable $failure, DeadLetterOptions $options): void
+    {
+        $deadLetterStream = $options->streamFor((string) $this->streamName, (string) $this->groupName);
+        $context = $message->context;
+        unset($context['retry_count']);
+
+        // No id: the driver gives the copy a new one. Redis only accepts a new
+        // entry id above the last one of the target stream, so the source id
+        // cannot be reused; the source id is kept in `dead_letter.message_id`.
+        $copy = new StreamMessage(
+            stream: $deadLetterStream,
+            type: $message->type,
+            data: $message->data,
+            context: [
+                ...$context,
+                'dead_letter' => [
+                    'source_stream' => $this->streamName,
+                    'group' => $this->groupName,
+                    'message_id' => $message->id,
+                    'attempts' => $attempts,
+                    'failed_at' => (new DateTimeImmutable())->format(DATE_ATOM),
+                    'error' => [
+                        'class' => $failure::class,
+                        'message' => $failure->getMessage(),
+                    ],
+                ],
+            ],
+        );
+
+        try {
+            $this->stream->publish($copy);
+        } catch (Throwable $e) {
+            // Acked anyway. Leaving it unacked would not keep it on Kafka (see
+            // processMessage()): it would still be skipped, and a good message
+            // would be redelivered in its place. So this log line is the last
+            // copy: it carries the full payload, ready to publish to the
+            // dead-letter stream by hand. It is written by the process itself,
+            // not by a listener, so `event_stream.debug` cannot turn it off,
+            // and it is written before the ack, so it exists even if the ack
+            // throws.
+            $this->logger()->critical(
+                'EventStream [Dead-letter publish failed] consumer={consumer} group={group} stream={stream} dead_letter_stream={dead_letter_stream} message_id={message_id} type={type} attempts={attempts} error={error} publish_error={publish_error} payload={payload}',
+                [
+                    'consumer' => $this->getConsumerName(),
+                    'group' => (string) $this->groupName,
+                    'stream' => (string) $this->streamName,
+                    'dead_letter_stream' => $deadLetterStream,
+                    'message_id' => (string) $message->id,
+                    'type' => $message->type,
+                    'attempts' => (string) $attempts,
+                    'error' => $failure->getMessage(),
+                    'publish_error' => $e->getMessage(),
+                    'payload' => (string) json_encode(
+                        ['stream' => $copy->stream, 'type' => $copy->type, 'data' => $copy->data, 'context' => $copy->context],
+                        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR,
+                    ),
+                ],
+            );
+            $this->stream->ack($this->groupName, $this->streamName, [$message->id]);
+
+            return;
+        }
+
+        try {
+            $this->event?->dispatch(new DeadLettered(
+                $this->getConsumerName(),
+                (string) $this->groupName,
+                (string) $this->streamName,
+                $deadLetterStream,
+                $message,
+                $attempts,
+                $failure,
+            ));
+        } finally {
+            // In `finally`: a listener of DeadLettered that throws must not
+            // leave the original unacked (see processMessage()).
+            $this->stream->ack($this->groupName, $this->streamName, [$message->id]);
+        }
+    }
+
+    protected function deadLetterOptions(): DeadLetterOptions
+    {
+        return DeadLetterOptions::fromConfig($this->config);
+    }
+
+    /**
+     * Coroutine-aware under the Swoole runtime hooks, so a pause blocks this
+     * message only. Kafka heartbeats run on a timer and keep going meanwhile.
+     */
+    protected function pause(int $milliseconds): void
+    {
+        if ($milliseconds > 0) {
+            Coroutine::sleep($milliseconds / 1000);
+        }
+    }
+
+    protected function logger(): StdoutLoggerInterface
+    {
+        return $this->container->get(StdoutLoggerInterface::class);
     }
 
     protected function processBatch(Generator $messages): void

@@ -109,6 +109,35 @@ return [
             // Default: 1 (sequential). Only increase for non-financial/non-ordered streams.
             // Example: 'default:notification-events' => 3
         ],
+
+        /**
+         * Retry in place and dead-letter queue.
+         *
+         * A message whose handler throws (or answers NACK) is retried in place, up to `max_attempts` times in
+         * total, with a pause of `backoff_ms`, then 2x, 4x, ... capped at `max_backoff_ms`. A message that still
+         * fails, or that throws one of the `skip_exceptions` below (no retry), is copied to the dead-letter stream
+         * `<stream>.<group_name><suffix>` with a `dead_letter` block in its context, and then acked. Replay it with
+         * `php bin/hyperf.php event-stream:dlq-replay --stream=<stream>`.
+         *
+         * The default budget is about 1.5 s (3 attempts, 500 ms then 1000 ms). Listeners run again on each retry,
+         * so they must be idempotent.
+         *
+         * The dead-letter streams must exist on the broker, unless it creates topics automatically.
+         *
+         * - enabled: false restores the behaviour before the dead-letter path: one attempt per delivery, and a
+         *   skip-listed exception is acked and dropped. Note that the Kafka driver never redelivers a failed message.
+         * - max_attempts: attempts in total, including the first. Shared with `#[ConsumedEvent(retries: n)]`.
+         * - backoff_ms: the first pause between two attempts, in milliseconds.
+         * - max_backoff_ms: the upper bound of one pause, in milliseconds.
+         * - suffix: the end of the dead-letter stream name.
+         */
+        'dead_letter' => [
+            'enabled' => true,
+            'max_attempts' => 3,
+            'backoff_ms' => 500,
+            'max_backoff_ms' => 5000,
+            'suffix' => '.dlq',
+        ],
     ],
 
     /**
@@ -127,14 +156,15 @@ return [
     /**
      * Exceptions to skip (acknowledge) during consumer processing.
      *
-     * When an exception occurs while handling a message, the consumer will normally leave the message unacknowledged
-     * so it can be retried later. Add exception classes to this list to *acknowledge the message anyway* when those
-     * exceptions are thrown—effectively skipping retries for known non-recoverable/expected failures (e.g. validation
-     * errors, permanently missing resources).
+     * When an exception occurs while handling a message, the consumer retries it in place (see
+     * `consumer.dead_letter`). Add exception classes to this list to skip those retries for known
+     * non-recoverable/expected failures (e.g. validation errors, permanently missing resources).
      *
      * Notes:
-     * - Use this to prevent “poison messages” from being retried indefinitely.
-     * - Only include exceptions that are safe to drop; skipped exceptions result in message loss for that failure case.
+     * - With `consumer.dead_letter.enabled` (the default), a skipped exception sends the message straight to the
+     *   dead-letter stream, where it can be inspected and replayed.
+     * - With `consumer.dead_letter.enabled` false, a skipped exception acknowledges the message and drops it: only
+     *   include exceptions that are safe to drop.
      *
      * Example:
      *   'skip_exceptions' => [
