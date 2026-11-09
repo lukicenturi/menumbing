@@ -16,6 +16,8 @@ class EventRegistry
 {
     protected array $events = [];
 
+    protected bool $initialized = false;
+
     public function init(): void
     {
         $classes = AnnotationCollector::getClassesByAnnotation(ConsumedEvent::class) ?? [];
@@ -34,6 +36,23 @@ class EventRegistry
                 'class' => $class,
                 'retries' => $annotation->retries,
             ];
+        }
+
+        $this->initialized = true;
+    }
+
+    /**
+     * Fills the registry unless that already happened.
+     *
+     * In a server, ConsumerManager::register() fills it at boot, and init()
+     * throws on a second fill (every name would conflict with itself). A
+     * console command never reaches that boot, so code that can run in both
+     * places calls this instead.
+     */
+    public function ensureInitialized(): void
+    {
+        if (!$this->initialized) {
+            $this->init();
         }
     }
 

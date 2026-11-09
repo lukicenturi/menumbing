@@ -46,6 +46,23 @@ class ConsumerFactory
         unset($this->consumers[$this->getCacheKey($poolName, $options)]);
     }
 
+    /**
+     * Leaves the group and stops the heartbeat of a consumer that get()
+     * already built, then forgets it. Does nothing for one that does not
+     * exist: building it here would join the group only to leave it.
+     */
+    public function close(string $poolName, array $options): void
+    {
+        $cacheKey = $this->getCacheKey($poolName, $options);
+
+        if (null === $consumer = $this->consumers[$cacheKey] ?? null) {
+            return;
+        }
+
+        unset($this->consumers[$cacheKey]);
+        $consumer->close();
+    }
+
     protected function getConfig(string $poolName, array $options): ConsumerConfig
     {
         if (null === $config =  $this->config->get('kafka.' . $poolName)) {

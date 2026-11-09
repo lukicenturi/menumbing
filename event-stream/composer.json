@@ -17,6 +17,7 @@
     },
     "require": {
         "php": ">=8.1",
+        "hyperf/command": "^3.1",
         "hyperf/di": "^3.1",
         "hyperf/redis": "^3.1",
         "hyperf/event": "^3.1",

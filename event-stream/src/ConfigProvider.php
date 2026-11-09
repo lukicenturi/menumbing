@@ -12,6 +12,7 @@ declare(strict_types=1);
 namespace Menumbing\EventStream;
 
 use Menumbing\Contract\EventStream\StreamInterface;
+use Menumbing\EventStream\Command\DlqReplayCommand;
 use Menumbing\EventStream\Factory\StreamFactory;
 use Menumbing\EventStream\Listener\DebugListener;
 use Menumbing\EventStream\Listener\RegisterConsumers;
@@ -26,6 +27,9 @@ class ConfigProvider
             'dependencies' => [
                 StreamFactory::class => StreamFactory::class,
                 StreamInterface::class => fn(ContainerInterface $container) => $container->get(StreamFactory::class)->get('default'),
+            ],
+            'commands' => [
+                DlqReplayCommand::class,
             ],
             'listeners' => [
                 RegisterProducers::class,

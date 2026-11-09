@@ -150,6 +150,16 @@ class KafkaStream implements StreamInterface
         return count($ids) === $count;
     }
 
+    /**
+     * Leaves the consumer group of a subscription, so that a static member
+     * does not hold its partitions until the session timeout. For short-lived
+     * consumers such as a console command; a consumer process never leaves.
+     */
+    public function leaveGroup(string $group, array $streams): void
+    {
+        $this->consumerFactory->close($this->options['pool'] ?? 'default', $this->getConsumerOptions($group, $streams));
+    }
+
     protected function deserialize(string $id, array $message, int $retryCount = 0): StreamMessage
     {
         $streamMessage = $this->serializer->deserialize($message['message'], StreamMessage::class, $this->options['deserialize_format'] ?? 'json');
