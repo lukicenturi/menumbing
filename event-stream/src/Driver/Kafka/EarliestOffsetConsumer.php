@@ -12,6 +12,7 @@ use longlang\phpkafka\Protocol\ListOffset\ListOffsetRequest;
 use longlang\phpkafka\Protocol\ListOffset\ListOffsetResponse;
 use longlang\phpkafka\Protocol\ListOffset\ListOffsetTopic;
 use longlang\phpkafka\Util\KafkaUtil;
+use Throwable;
 
 /**
  * A consumer that starts at the earliest retained message when its position
@@ -30,6 +31,9 @@ use longlang\phpkafka\Util\KafkaUtil;
  *
  * Selected with the consumer option `offset_reset => 'earliest'`.
  *
+ * If that seek fails, the consumer stops its heartbeat, leaves the group and
+ * throws: it does not fall back to the library position.
+ *
  * Limit: a segment that expires while this consumer reads it still triggers
  * the library's jump to the end, because that fallback runs inside the
  * private fetch loop.
@@ -43,9 +47,28 @@ class EarliestOffsetConsumer extends Consumer
 
     public function rejoin(): void
     {
-        parent::rejoin();
+        $this->joinGroup();
 
-        $this->seekToEarliestWhereNotRetained();
+        try {
+            $this->seekToEarliestWhereNotRetained();
+        } catch (Throwable $e) {
+            // The join already started the heartbeat timer. Left alone, a
+            // failed seek would leave a joined member with a live timer behind
+            // (one per failed subscribe round, and FENCED_INSTANCE_ID on later
+            // ticks). Rethrown, not swallowed: falling back to the library
+            // position could jump to the newest message, and a wrong start
+            // position is worse than a failed run. The caller builds a new
+            // consumer on its next round.
+            $this->stopHeartbeat();
+
+            try {
+                $this->close();
+            } catch (Throwable) {
+                // Leaving the group is best effort; the error that matters is $e.
+            }
+
+            throw $e;
+        }
     }
 
     /**
@@ -69,6 +92,14 @@ class EarliestOffsetConsumer extends Consumer
         }
 
         return $steps;
+    }
+
+    /**
+     * The library join; a seam so the order (join first, then seek) is testable.
+     */
+    protected function joinGroup(): void
+    {
+        parent::rejoin();
     }
 
     protected function seekToEarliestWhereNotRetained(): void
@@ -108,9 +139,11 @@ class EarliestOffsetConsumer extends Consumer
         foreach ($partitions as $partition) {
             $brokerId = $broker->getBrokerIdByTopic($topic, $partition);
 
-            // No known leader yet: leave that partition on the library's own
-            // position rather than asking broker 0 by accident.
-            if (null === $brokerId) {
+            // No known leader: null when the partition is not in the metadata,
+            // -1 (the metadata leader id) when it has no leader right now.
+            // Leave that partition on the library's own position rather than
+            // asking a broker that does not exist.
+            if (null === $brokerId || $brokerId < 0) {
                 continue;
             }
 

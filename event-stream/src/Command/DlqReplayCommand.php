@@ -42,7 +42,8 @@ use function Hyperf\Support\make;
  * copy published there would be consumed again by every other group on it,
  * and their listeners would do the same work twice.
  *
- * Reads with its own consumer group, `<group_name>-dlq-replay`. Later runs
+ * Reads with its own consumer group, `<group>-dlq-replay`, where `<group>` is
+ * --group or `event_stream.group_name`. Later runs
  * resume after the last acked message. The start position needs care:
  *
  * - Kafka: longlang/phpkafka starts a new group at offset 0, and when that
@@ -139,6 +140,7 @@ class DlqReplayCommand extends HyperfCommand
         $this->setHelp(
             'Messages are dispatched again to the listeners of this application; nothing is published to the source stream. '
             . 'On a dead-letter topic with several partitions, a run with --type or with held messages can stop early; run it again. '
+            . 'The group defaults to event_stream.group_name; give --group for a consumer process that sets its own group. '
             . 'CLI only: do not run it from a crontab inside the server.',
         );
         $this->addOption('stream', null, InputOption::VALUE_REQUIRED, 'The source stream, e.g. user-events (not its dead-letter name). Required.');
@@ -149,6 +151,7 @@ class DlqReplayCommand extends HyperfCommand
         $this->addOption('max-replays', null, InputOption::VALUE_REQUIRED, 'Hold a message that was already replayed this many times (poison guard).', '3');
         $this->addOption('discard-poisoned', null, InputOption::VALUE_NONE, 'Ack held messages instead of keeping them; the payload goes to a warning log line.');
         $this->addOption('driver', null, InputOption::VALUE_REQUIRED, 'The event stream driver of the source stream.', 'default');
+        $this->addOption('group', 'g', InputOption::VALUE_REQUIRED, 'The consumer group whose dead letters to replay (default: event_stream.group_name). For a process that sets its own $groupName.');
     }
 
     public function handle(): int
@@ -177,7 +180,10 @@ class DlqReplayCommand extends HyperfCommand
             return self::FAILURE;
         }
 
-        $consumerGroup = (string) $this->config->get('event_stream.group_name', 'menumbing');
+        // A consumer process may set its own public $groupName; its dead
+        // letters are named after, and stamped with, that group.
+        $consumerGroup = trim((string) $this->input->getOption('group'));
+        $consumerGroup = '' === $consumerGroup ? (string) $this->config->get('event_stream.group_name', 'menumbing') : $consumerGroup;
         $deadLetterStream = $options->streamFor($source, $consumerGroup);
         $group = $consumerGroup . self::GROUP_SUFFIX;
         $limit = max(1, (int) $this->input->getOption('limit'));

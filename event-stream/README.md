@@ -226,7 +226,9 @@ was a silent and permanent loss of the message on Kafka.
    `backoff_ms`, then 2 x `backoff_ms`, and so on, with a maximum of
    `max_backoff_ms`. Each failed attempt dispatches `ConsumeFailed`.
 3. An exception in `skip_exceptions` does not get a retry. The consumer sends
-   the message to the dead-letter stream at once.
+   the message to the dead-letter stream at once. This also applies when the
+   handler turns the exception into a NACK (`#[ConsumedEvent(retries: n)]`).
+   A NACK without an exception is never skip-listed.
 4. After the last failed attempt, the consumer publishes a copy of the message
    to the dead-letter stream, dispatches `DeadLettered`, and then acks the
    original. The copy has the same `type` and `data`, and a `dead_letter`
@@ -252,8 +254,13 @@ was a silent and permanent loss of the message on Kafka.
    level, and then acks the original. This line contains the full message as
    JSON. It is the last copy of the message.
 7. If a `DeadLettered` listener throws, the consumer logs
-   `EventStream [Dead-lettered listener failed] ...` at `error` level, acks
-   the original, and then throws the listener exception again.
+   `EventStream [Dead-lettered listener failed] ...` at `error` level and
+   then acks the original. The consumer does not throw the listener exception
+   again: the log line already records it.
+8. If a `BeforeConsume`, `AfterConsume` or `ConsumeFailed` listener throws,
+   the consumer logs `EventStream [Listener failed] event=... ...` at `error`
+   level and continues. A listener failure does not change the result of the
+   attempt, and it does not prevent the ack or the dead letter.
 
 The consumer acks every message exactly 1 time. With longlang/phpkafka an ack
 is not a mark on 1 message: it adds 1 to the fetch offset of the partition and
@@ -287,7 +294,8 @@ consumer acks every message that it finishes.
 ### Dead-letter stream name
 
 `<stream>.<group><suffix>`, for example `user-events.billing-service.dlq`.
-`<group>` is `event_stream.group_name`.
+`<group>` is the group of the consumer process: `event_stream.group_name`,
+unless a custom process sets its own `$groupName`.
 
 The name contains the group because a stream is often a fan-out stream: more
 than 1 service reads it, each with its own group. A dead letter belongs to the
@@ -316,14 +324,17 @@ php bin/hyperf.php event-stream:dlq-replay --stream=user-events --type=user.crea
 | `--max-replays` | `3` | Hold a message that the command replayed this number of times (poison guard). |
 | `--discard-poisoned` | off | Ack a held message and do not keep it. The payload goes to a `warning` log line. |
 | `--driver` | `default` | The event stream driver of the source stream. |
+| `--group` | `event_stream.group_name` | The consumer group whose dead letters to replay. Use it for a consumer process that sets its own `$groupName`. |
 
 The replay is local. The command gives each message to the listeners of this
 application through `ConsumerEventHandler`, in the same way as the consumer.
 The command does not publish to `<stream>`: other groups read that stream, and
 a copy there would run again in each of them.
 
-The command reads the dead-letter stream with the group `<group>-dlq-replay`.
-Each run starts after the last message that a real run acked.
+The command reads `<stream>.<group><suffix>` with the group
+`<group>-dlq-replay`, where `<group>` is `--group` or `event_stream.group_name`.
+A dead letter with another `dead_letter.group` is foreign and is kept. Each
+run starts after the last message that a real run acked.
 
 The start position of the first run:
 
@@ -331,7 +342,10 @@ The start position of the first run:
   already deleted that offset, the client goes to the newest message and skips
   every older dead letter. To prevent this, the command reads with the Kafka
   consumer option `offset_reset => 'earliest'`: a position that is not
-  retained moves to the earliest retained message.
+  retained moves to the earliest retained message. If the consumer cannot
+  get the earliest offsets, it stops its heartbeat, leaves the group and
+  fails the run (exit code 1). It does not fall back to the client position,
+  because that position can be the newest message.
 - Redis: the command creates the replay group at the start of the stream.
 
 Retention still applies. A dead letter that the broker deletes before a real

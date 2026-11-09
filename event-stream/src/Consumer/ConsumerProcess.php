@@ -97,9 +97,9 @@ abstract class ConsumerProcess extends AbstractProcess
                 $messages = $this->stream->getIdleMessages($consumerName, $this->groupName, [$this->streamName], $retryAfter);
 
                 // Same guard as the subscribe loop below: a throw out of
-                // processMessage() (an ack failure, or a DeadLettered listener
-                // that threw after the ack) must not end this coroutine, or
-                // pending entries would never be reclaimed again until restart.
+                // processMessage() (an ack failure, for example) must not end
+                // this coroutine, or pending entries would never be reclaimed
+                // again until restart.
                 try {
                     foreach ($messages as $message) {
                         $this->processMessage($message);
@@ -191,7 +191,7 @@ abstract class ConsumerProcess extends AbstractProcess
             $attempt = $message->withContext(['retry_count' => $attempts]);
             ++$attempts;
 
-            $this->event?->dispatch(new BeforeConsume($consumerName, $this->groupName, $attempt, $this->stream, $this->driverName));
+            $this->dispatchGuarded(new BeforeConsume($consumerName, $this->groupName, $attempt, $this->stream, $this->driverName), $attempt);
 
             ConsumerEventHandler::takeNackReason();
 
@@ -203,7 +203,7 @@ abstract class ConsumerProcess extends AbstractProcess
 
             if (Result::ACK === $result) {
                 $this->stream->ack($this->groupName, $this->streamName, [$message->id]);
-                $this->event?->dispatch(new AfterConsume($consumerName, $this->groupName, $attempt, $this->stream, $this->driverName));
+                $this->dispatchGuarded(new AfterConsume($consumerName, $this->groupName, $attempt, $this->stream, $this->driverName), $attempt);
 
                 return;
             }
@@ -213,11 +213,14 @@ abstract class ConsumerProcess extends AbstractProcess
                 : (ConsumerEventHandler::takeNackReason() ?? MessageNackedException::afterAttempt($attempts));
 
             // One `EventStream [Consume failed]` line per failed attempt.
-            $this->event?->dispatch(new ConsumeFailed($consumerName, $this->groupName, $attempt, $this->stream, $this->driverName, $failure));
+            $this->dispatchGuarded(new ConsumeFailed($consumerName, $this->groupName, $attempt, $this->stream, $this->driverName, $failure), $attempt);
 
             // A skip-listed exception is deterministic (bad payload, broken
-            // invariant): another attempt would fail the same way.
-            if ($result instanceof Throwable && $this->skipException($result)) {
+            // invariant): another attempt would fail the same way. `$failure`
+            // is the real exception also when ConsumerEventHandler turned it
+            // into a NACK (`retries: n`). A bare NACK has no exception to
+            // match, so it is never skipped.
+            if (!$failure instanceof MessageNackedException && $this->skipException($failure)) {
                 break;
             }
 
@@ -335,10 +338,11 @@ abstract class ConsumerProcess extends AbstractProcess
             return;
         }
 
-        $listenerFailure = null;
-
-        try {
-            $this->event?->dispatch(new DeadLettered(
+        // Not rethrown: the failure is logged before the ack, and a rethrow
+        // after it would only reach the subscribe loop as a misleading
+        // `Subscribe failed`, and drop the rest of the fetched batch.
+        $this->dispatchGuarded(
+            new DeadLettered(
                 $this->getConsumerName(),
                 (string) $this->groupName,
                 (string) $this->streamName,
@@ -346,32 +350,50 @@ abstract class ConsumerProcess extends AbstractProcess
                 $message,
                 $attempts,
                 $failure,
-            ));
+            ),
+            $message,
+            ['dead_letter_stream' => $deadLetterStream],
+        );
+
+        $this->stream->ack($this->groupName, $this->streamName, [$message->id]);
+    }
+
+    /**
+     * Dispatches an event of the retry and dead-letter path, and logs a
+     * listener that throws instead of letting it out.
+     *
+     * These events are for observation. A throw out of a listener must not
+     * leave processMessage() early: that would skip the ack and the dead
+     * letter, which is the silent loss this path exists to prevent. The log
+     * line is written before anything else happens to the message.
+     *
+     * @param  array<string, string>  $extra
+     */
+    protected function dispatchGuarded(object $event, StreamMessage $message, array $extra = []): void
+    {
+        try {
+            $this->event?->dispatch($event);
         } catch (Throwable $e) {
-            // A listener of DeadLettered that throws must not leave the
-            // original unacked (see processMessage()). It is logged before the
-            // ack, so the record of where the message went survives an ack
-            // that throws too; then it is rethrown.
-            $listenerFailure = $e;
+            $label = $event instanceof DeadLettered ? 'Dead-lettered listener failed' : 'Listener failed';
+            $fields = [
+                'consumer' => $this->getConsumerName(),
+                'group' => (string) $this->groupName,
+                'stream' => (string) $this->streamName,
+                ...$extra,
+                'message_id' => (string) $message->id,
+                'type' => $message->type,
+            ];
+            $placeholders = implode(' ', array_map(static fn (string $key): string => sprintf('%s={%s}', $key, $key), array_keys($fields)));
+
             $this->logger()->error(
-                'EventStream [Dead-lettered listener failed] consumer={consumer} group={group} stream={stream} dead_letter_stream={dead_letter_stream} message_id={message_id} type={type} error={error}',
+                sprintf('EventStream [%s] event={event} %s error={error}', $label, $placeholders),
                 [
-                    'consumer' => $this->getConsumerName(),
-                    'group' => (string) $this->groupName,
-                    'stream' => (string) $this->streamName,
-                    'dead_letter_stream' => $deadLetterStream,
-                    'message_id' => (string) $message->id,
-                    'type' => $message->type,
+                    ...$fields,
+                    'event' => $event::class,
                     'error' => $e->getMessage(),
                     'exception' => (string) $e,
                 ],
             );
-        }
-
-        $this->stream->ack($this->groupName, $this->streamName, [$message->id]);
-
-        if (null !== $listenerFailure) {
-            throw $listenerFailure;
         }
     }
 
