@@ -42,11 +42,19 @@ use function Hyperf\Support\make;
  * copy published there would be consumed again by every other group on it,
  * and their listeners would do the same work twice.
  *
- * Reads with its own consumer group, `<group_name>-dlq-replay`. On Kafka a
- * group with no committed offset starts at offset 0 with longlang/phpkafka, so
- * the first run reads the whole retained dead-letter stream and later runs
- * resume where the last one stopped. On Redis the group is created at the
- * start of the stream for the same reason.
+ * Reads with its own consumer group, `<group_name>-dlq-replay`. Later runs
+ * resume after the last acked message. The start position needs care:
+ *
+ * - Kafka: longlang/phpkafka starts a new group at offset 0, and when that
+ *   offset is no longer retained it jumps to the NEWEST message, which skips
+ *   every older retained dead letter. So the command reads with
+ *   `offset_reset => 'earliest'` (EarliestOffsetConsumer): a position that is
+ *   not retained moves to the earliest retained message instead.
+ * - Redis: the group is created at the start of the stream, because the dead
+ *   letters were written before it existed.
+ *
+ * A dead letter that retention deletes before a real run is gone; a dry run
+ * commits nothing, so it does not hold the position either.
  *
  * Three traits of the Kafka client shape this command:
  *
@@ -346,11 +354,19 @@ class DlqReplayCommand extends HyperfCommand
     }
 
     /**
-     * Kafka has nothing to create. On Redis the replay group must start at the
-     * beginning of the stream: the dead letters were written before it existed.
+     * Prepares the replay group to read from the start of what is retained.
+     *
+     * Kafka has no group to create, but its client would jump to the newest
+     * message when the start position is no longer retained (see the class
+     * comment). On Redis the replay group must start at the beginning of the
+     * stream: the dead letters were written before it existed.
      */
     protected function createReplayGroup(string $group, string $deadLetterStream): void
     {
+        if ($this->stream instanceof KafkaStream) {
+            $this->stream->setOffsetReset('earliest');
+        }
+
         if ($this->stream instanceof RedisStream) {
             $this->stream->createGroup($group, $deadLetterStream, ReadMessageFrom::BEGINNING);
 
@@ -514,7 +530,9 @@ class DlqReplayCommand extends HyperfCommand
         }
 
         $context = $message->context;
-        unset($context['dead_letter'], $context['retry_count']);
+        // `owner` is added by RedisStream::getIdleMessages() to a claimed entry;
+        // it describes this read, not the message.
+        unset($context['dead_letter'], $context['retry_count'], $context['owner']);
         $context['replayed_from_dlq'] = [
             'at' => (new DateTimeImmutable())->format(DATE_ATOM),
             'original_message_id' => $originalId,
@@ -535,8 +553,9 @@ class DlqReplayCommand extends HyperfCommand
         $replay = new StreamMessage($run['source'], $message->type, $message->data, [...$context, 'retry_count' => 0], $message->id);
 
         try {
+            ConsumerEventHandler::takeNackReason();
             $result = call_user_func($this->handler(), $run['consumer_group'], $replay);
-            $failure = Result::ACK === $result ? null : MessageNackedException::afterAttempt(1);
+            $failure = Result::ACK === $result ? null : (ConsumerEventHandler::takeNackReason() ?? MessageNackedException::afterAttempt(1));
         } catch (Throwable $e) {
             $failure = $e;
         }
@@ -633,7 +652,7 @@ class DlqReplayCommand extends HyperfCommand
     private function park(StreamMessage $message, array $run): bool
     {
         $context = $message->context;
-        unset($context['retry_count']);
+        unset($context['retry_count'], $context['owner']);
 
         if (!isset($context['replayed_from_dlq']['original_message_id']) && !isset($context['dead_letter']['message_id'])) {
             $context['dead_letter'] = [...(array) ($context['dead_letter'] ?? []), 'message_id' => $message->id];

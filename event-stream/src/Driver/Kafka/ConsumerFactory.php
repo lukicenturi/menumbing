@@ -34,7 +34,8 @@ class ConsumerFactory
             return $consumer;
         }
 
-        $consumer = new Consumer($this->getConfig($poolName, $options));
+        $consumerClass = $this->getConsumerClass($options);
+        $consumer = new $consumerClass($this->getConfig($poolName, $options));
 
         $this->consumers[$cacheKey] = $consumer;
 
@@ -61,6 +62,18 @@ class ConsumerFactory
 
         unset($this->consumers[$cacheKey]);
         $consumer->close();
+    }
+
+    /**
+     * `offset_reset => 'earliest'` selects EarliestOffsetConsumer: a position
+     * that retention already deleted moves to the earliest retained message,
+     * not to the newest one (the longlang/phpkafka default).
+     *
+     * @return class-string<Consumer>
+     */
+    protected function getConsumerClass(array $options): string
+    {
+        return 'earliest' === ($options['offset_reset'] ?? null) ? EarliestOffsetConsumer::class : Consumer::class;
     }
 
     protected function getConfig(string $poolName, array $options): ConsumerConfig

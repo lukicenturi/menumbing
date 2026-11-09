@@ -30,6 +30,8 @@ class KafkaStream implements StreamInterface
 
     protected ?string $consumerName = null;
 
+    protected ?string $offsetReset = null;
+
     /**
      * Set the consumer name used for Kafka static membership (group_instance_id).
      * Called by ConsumerProcess before subscribe() — the name is derived from
@@ -39,6 +41,17 @@ class KafkaStream implements StreamInterface
     public function setConsumerName(string $consumerName): void
     {
         $this->consumerName = $consumerName;
+    }
+
+    /**
+     * `'earliest'` makes the consumers of this stream start at the earliest
+     * retained message when their position is no longer retained (see
+     * EarliestOffsetConsumer). Null keeps the driver option `offset_reset`,
+     * or the client default, which jumps to the newest message.
+     */
+    public function setOffsetReset(?string $offsetReset): void
+    {
+        $this->offsetReset = $offsetReset;
     }
 
     public function __construct(
@@ -190,6 +203,10 @@ class KafkaStream implements StreamInterface
         // This enables instant rejoin on pod restart without waiting for session_timeout.
         if ($this->consumerName !== null) {
             $options['consumer_name'] = $this->consumerName;
+        }
+
+        if ($this->offsetReset !== null) {
+            $options['offset_reset'] = $this->offsetReset;
         }
 
         return $options;
