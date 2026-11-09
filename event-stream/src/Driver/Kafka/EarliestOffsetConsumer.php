@@ -106,7 +106,15 @@ class EarliestOffsetConsumer extends Consumer
         $byBroker = [];
 
         foreach ($partitions as $partition) {
-            $byBroker[$broker->getBrokerIdByTopic($topic, $partition)][] = $partition;
+            $brokerId = $broker->getBrokerIdByTopic($topic, $partition);
+
+            // No known leader yet: leave that partition on the library's own
+            // position rather than asking broker 0 by accident.
+            if (null === $brokerId) {
+                continue;
+            }
+
+            $byBroker[$brokerId][] = $partition;
         }
 
         $earliest = [];

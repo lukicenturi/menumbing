@@ -96,8 +96,16 @@ abstract class ConsumerProcess extends AbstractProcess
             while (ProcessManager::isRunning()) {
                 $messages = $this->stream->getIdleMessages($consumerName, $this->groupName, [$this->streamName], $retryAfter);
 
-                foreach ($messages as $message) {
-                    $this->processMessage($message);
+                // Same guard as the subscribe loop below: a throw out of
+                // processMessage() (an ack failure, or a DeadLettered listener
+                // that threw after the ack) must not end this coroutine, or
+                // pending entries would never be reclaimed again until restart.
+                try {
+                    foreach ($messages as $message) {
+                        $this->processMessage($message);
+                    }
+                } catch (Throwable $e) {
+                    $this->logThrowable($e);
                 }
 
                 if (CoordinatorManager::until(Constants::WORKER_EXIT)->yield($this->config->get('event_stream.consumer.block_for', 1))) {
